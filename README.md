@@ -47,20 +47,19 @@ Open the ZHMModSDK overlay menu (`~` key) to access settings:
 
 ## Building
 
-### Prerequisites
-
-- Visual Studio with C++ and game development workloads
-- CMake 3.24+
-
 ### Steps
 
-1. Clone this repository.
-2. Open in Visual Studio or configure with CMake:
-   ```
-   cmake --preset x64-Debug
-   cmake --build _build/x64-Debug
-   ```
-3. The built DLL will be in the output directory.
+### 1. Clone this repository locally with all submodules.
+
+You can either use `git clone --recurse-submodules` or run `git submodule update --init --recursive` after cloning.
+
+### 2. Install Visual Studio (any edition).
+
+Make sure you install the C++ and game development workloads.
+
+### 3. Open the project in your IDE of choice.
+
+See instructions for [Visual Studio](https://github.com/OrfeasZ/ZHMModSDK/wiki/Setting-up-Visual-Studio-for-development) or [CLion](https://github.com/OrfeasZ/ZHMModSDK/wiki/Setting-up-CLion-for-development).
 
 See the [ZHMModSDK wiki](https://github.com/OrfeasZ/ZHMModSDK/wiki) for detailed IDE setup instructions.
 
