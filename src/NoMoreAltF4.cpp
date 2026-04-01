@@ -2,53 +2,628 @@
 
 #include <Logging.h>
 #include <IconsMaterialDesign.h>
+#include <imgui.h>
+#include <Hooks.h>
 #include <Globals.h>
+#include <Glacier/ZHttp.h>
+#include <Glacier/ZHitman5.h>
+#include <Glacier/ZContract.h>
+#include <Glacier/SOnlineEvent.h>
 
-#include <Glacier/ZGameLoopManager.h>
-#include <Glacier/ZScene.h>
+#include <Windows.h>
+#pragma comment(lib, "winhttp.lib")
 
-void NoMoreAltF4::OnEngineInitialized() {
-    Logger::Info("NoMoreAltF4 has been initialized!");
+// =============================================================================
+// SDK Plugin Registration
+// =============================================================================
+// DEFINE_ZHM_PLUGIN creates the singleton instance and exports:
+//   GetPluginInterface(), CompiledSdkVersion(), CompiledSdkAbiVersion()
+DEFINE_ZHM_PLUGIN(NoMoreAltF4);
 
-    // Register a function to be called on every game frame while the game is in play mode.
-    const ZMemberDelegate<NoMoreAltF4, void(const SGameUpdateEvent&)> s_Delegate(this, &NoMoreAltF4::OnFrameUpdate);
-    Globals::GameLoopManager->RegisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
+// Settings INI section name
+static const ZString S_SETTINGS_SECTION = "NoMoreAltF4";
 
-    // Install a hook to print the name of the scene every time the game loads a new one.
-    Hooks::ZEntitySceneContext_LoadScene->AddDetour(this, &NoMoreAltF4::OnLoadScene);
+// Static storage for the original WinHttpSendRequest pointer (pre-hook).
+NoMoreAltF4::FnWinHttpSendRequest NoMoreAltF4::s_OriginalSendRequest = nullptr;
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+void NoMoreAltF4::Init()
+{
+    // Load persisted settings from the plugin's INI file.
+    // Settings API: GetSettingBool(section, name, defaultValue)
+    m_AutoKillEnabled      = GetSettingBool(S_SETTINGS_SECTION, "AutoKillEnabled",      true);
+    m_FreelancerOnly       = GetSettingBool(S_SETTINGS_SECTION, "FreelancerOnly",       false);
+    m_ManualKillKey        = static_cast<int>(GetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", VK_F9));
+    m_BlockNetworkOnDeath  = GetSettingBool(S_SETTINGS_SECTION, "BlockNetworkOnDeath",  true);
+    m_LogHttpRequests      = GetSettingBool(S_SETTINGS_SECTION, "LogHttpRequests",      true);
+
+    Logger::Info("[NoMoreAltF4] Plugin loaded. Auto-kill: {}, Freelancer-only: {}, Hotkey: 0x{:X}, BlockNet: {}, LogHTTP: {}",
+        m_AutoKillEnabled, m_FreelancerOnly, m_ManualKillKey, m_BlockNetworkOnDeath, m_LogHttpRequests);
 }
 
-NoMoreAltF4::~NoMoreAltF4() {
-    // Unregister our frame update function when the mod unloads.
-    const ZMemberDelegate<NoMoreAltF4, void(const SGameUpdateEvent&)> s_Delegate(this, &NoMoreAltF4::OnFrameUpdate);
-    Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
+void NoMoreAltF4::OnEngineInitialized()
+{
+    Logger::Info("[NoMoreAltF4] Engine initialized. Death detection active.");
+    m_Initialized = true;
+    m_WasAlive = false;
+
+    // Register SDK event/network hooks.
+    Hooks::ZAchievementManagerSimple_OnEventReceived->AddDetour(this, &NoMoreAltF4::ZAchievementManagerSimple_OnEventReceived);
+    Hooks::ZAchievementManagerSimple_OnEventSent->AddDetour(this, &NoMoreAltF4::ZAchievementManagerSimple_OnEventSent);
+    Hooks::Http_WinHttpCallback->AddDetour(this, &NoMoreAltF4::Http_WinHttpCallback);
+    Hooks::ZHttpResultDynamicObject_OnBufferReady->AddDetour(this, &NoMoreAltF4::ZHttpResultDynamicObject_OnBufferReady);
+
+    // Install manual IAT hook for WinHttpSendRequest so we can read POST bodies.
+    InstallSendRequestHook();
 }
 
-void NoMoreAltF4::OnDrawMenu() {
-    // Toggle our message when the user presses our button.
-    if (ImGui::Button(ICON_MD_LOCAL_FIRE_DEPARTMENT " NoMoreAltF4")) {
-        m_ShowMessage = !m_ShowMessage;
-    }
+NoMoreAltF4::~NoMoreAltF4()
+{
+    // Remove SDK detours registered with this plugin instance.
+    Hooks::ZAchievementManagerSimple_OnEventReceived->RemoveDetoursWithContext(this);
+    Hooks::ZAchievementManagerSimple_OnEventSent->RemoveDetoursWithContext(this);
+    Hooks::Http_WinHttpCallback->RemoveDetoursWithContext(this);
+    Hooks::ZHttpResultDynamicObject_OnBufferReady->RemoveDetoursWithContext(this);
+
+    // Restore original WinHttpSendRequest.
+    RemoveSendRequestHook();
+
+    Logger::Info("[NoMoreAltF4] Plugin unloaded.");
 }
 
-void NoMoreAltF4::OnDrawUI(bool p_HasFocus) {
-    if (m_ShowMessage) {
-        // Show a window for our mod.
-        if (ImGui::Begin("NoMoreAltF4", &m_ShowMessage)) {
-            // Only show these when the window is expanded.
-            ImGui::Text("Hello from NoMoreAltF4!");
+// =============================================================================
+// Per-Frame Logic (runs inside OnDrawUI, called every frame)
+// =============================================================================
+
+void NoMoreAltF4::OnDrawUI(bool p_HasFocus)
+{
+    if (!m_Initialized)
+        return;
+
+    // --- Manual hotkey check (edge-triggered: fires once on key down) ---
+    bool keyDown = (GetAsyncKeyState(m_ManualKillKey) & 0x8000) != 0;
+    if (keyDown && !m_ManualKillKeyPrevState)
+    {
+        if (ShouldProtect())
+        {
+            Logger::Warn("[NoMoreAltF4] Manual abort triggered (hotkey 0x{:X}). Terminating.", m_ManualKillKey);
+            KillProcess();
+            return;
         }
-        ImGui::End();
+    }
+    m_ManualKillKeyPrevState = keyDown;
+
+    // --- Reset death detection on new mission entry ---
+    {
+        auto s_LocalPlayer = SDK()->GetLocalPlayer();
+        bool s_InMission = static_cast<bool>(s_LocalPlayer);
+
+        if (s_InMission && !m_PlayerWasInMission)
+        {
+            // Just entered a mission — clear stale death flag
+            m_DeathDetected = false;
+        }
+        m_PlayerWasInMission = s_InMission;
+    }
+
+    // --- Auto-kill on death ---
+    if (!m_AutoKillEnabled)
+        return;
+
+    if (!ShouldProtect())
+        return;
+
+    bool alive = IsPlayerAlive();
+
+    // Detect transition: was alive last frame, now dead
+    // (Backup path — primary kill is triggered directly from OnEventReceived)
+    if (m_WasAlive && !alive)
+    {
+        Logger::Warn("[NoMoreAltF4] Player death detected (frame poll)! Terminating process.");
+        KillProcess();
+        return;
+    }
+
+    m_WasAlive = alive;
+}
+
+// =============================================================================
+// Player Alive Detection
+// =============================================================================
+//
+// Uses a hybrid approach:
+//   1. SDK()->GetLocalPlayer() — returns TEntityRef<ZHitman5>, null when not
+//      in a mission (main menu, loading, etc.). Null = safe, don't trigger.
+//   2. m_DeathDetected flag — set by ZAchievementManagerSimple_OnEventReceived
+//      when a "ContractFailed" event fires. This is the game's own signal that
+//      the player died / mission failed.
+//
+// ZHitman5 does not inherit IActor (which has IsDead()/IsAlive()), and does
+// not expose an alive/dead field directly in the SDK headers. The event-based
+// approach is reliable because ContractFailed IS the death event in Freelancer.
+
+bool NoMoreAltF4::IsPlayerAlive() const
+{
+    // Not in a mission — treat as alive (safe: won't trigger false kills)
+    auto s_LocalPlayer = SDK()->GetLocalPlayer();
+    if (!s_LocalPlayer)
+        return true;
+
+    // Death detected via the game's own event system
+    if (m_DeathDetected)
+        return false;
+
+    return true;
+}
+
+// =============================================================================
+// Freelancer Mode Detection
+// =============================================================================
+//
+// Freelancer mode uses the internal codename "Evergreen" throughout Glacier 2.
+// All Freelancer scenes (safehouse + missions) include "Evergreen" in the
+// scene path stored in ZContractsManager::SContractContext::m_sScene.
+
+bool NoMoreAltF4::IsFreelancerMode() const
+{
+    auto* s_ContractsManager = Globals::ContractsManager;
+    if (!s_ContractsManager)
+        return false;
+
+    const auto& s_Scene = s_ContractsManager->m_contractContext.m_sScene;
+    if (s_Scene.size() == 0)
+        return false;
+
+    // "Evergreen" is IOI's internal codename for Freelancer mode
+    return strstr(s_Scene.c_str(), "Evergreen") != nullptr;
+}
+
+// Returns true when protection features should be active.
+// When FreelancerOnly is enabled and we're not in Freelancer, everything is off.
+bool NoMoreAltF4::ShouldProtect() const
+{
+    return !m_FreelancerOnly || IsFreelancerMode();
+}
+
+// =============================================================================
+// Process Termination
+// =============================================================================
+
+void NoMoreAltF4::KillProcess()
+{
+    // Set the network block flag FIRST so any concurrent threads that are about
+    // to dispatch achievement events or HTTP requests get intercepted during the
+    // brief window between this flag set and the OS actually killing the process.
+    if (m_BlockNetworkOnDeath)
+        m_NetworkBlocked = true;
+
+    // TerminateProcess is used instead of ExitProcess because:
+    // - ExitProcess runs DLL detach routines and atexit handlers, which could
+    //   trigger save/cleanup code that writes the death state to IOI servers
+    // - TerminateProcess immediately kills the process with no cleanup
+    // - This replicates the exact effect of Alt-F4 -> OS force kill
+    TerminateProcess(GetCurrentProcess(), 0);
+
+    // Unreachable safety fallback
+    ExitProcess(0);
+}
+
+// =============================================================================
+// WinHttpSendRequest IAT Hook
+// =============================================================================
+//
+// The game's import table has a slot for WinHttpSendRequest. We patch that slot
+// to point to our function. This is lighter-weight than an inline hook and does
+// not require any external library — just standard PE header walking.
+//
+// Thread safety: the patch is done under VirtualProtect PAGE_READWRITE, which
+// is a single pointer write (atomic on x64). No lock needed.
+// =============================================================================
+
+// Helper: walk the game's import table and swap WinHttpSendRequest's slot.
+// Returns the old function pointer, or nullptr if the import was not found.
+static NoMoreAltF4::FnWinHttpSendRequest PatchIAT(NoMoreAltF4::FnWinHttpSendRequest p_New)
+{
+    auto* s_Base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!s_Base)
+        return nullptr;
+
+    auto& s_DosHdr = *reinterpret_cast<IMAGE_DOS_HEADER*>(s_Base);
+    auto& s_NtHdr  = *reinterpret_cast<IMAGE_NT_HEADERS*>(s_Base + s_DosHdr.e_lfanew);
+
+    auto& s_ImpDir = s_NtHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!s_ImpDir.VirtualAddress)
+        return nullptr;
+
+    auto* s_Desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(s_Base + s_ImpDir.VirtualAddress);
+    for (; s_Desc->Name; ++s_Desc)
+    {
+        const char* s_DllName = reinterpret_cast<const char*>(s_Base + s_Desc->Name);
+        if (_stricmp(s_DllName, "winhttp.dll") != 0)
+            continue;
+
+        auto* s_Thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(s_Base + s_Desc->FirstThunk);
+        auto* s_Orig  = reinterpret_cast<IMAGE_THUNK_DATA*>(s_Base + s_Desc->OriginalFirstThunk);
+
+        for (size_t i = 0; s_Thunk[i].u1.Function; ++i)
+        {
+            // Match by name (skip ordinal imports)
+            if (s_Orig[i].u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                continue;
+
+            auto* s_Import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(s_Base + s_Orig[i].u1.AddressOfData);
+            if (strcmp(s_Import->Name, "WinHttpSendRequest") != 0)
+                continue;
+
+            // Found the slot — swap it.
+            void** s_Slot = reinterpret_cast<void**>(&s_Thunk[i].u1.Function);
+            DWORD s_OldProtect;
+            VirtualProtect(s_Slot, sizeof(void*), PAGE_READWRITE, &s_OldProtect);
+            auto* s_Old = reinterpret_cast<NoMoreAltF4::FnWinHttpSendRequest>(*s_Slot);
+            *s_Slot = reinterpret_cast<void*>(p_New);
+            VirtualProtect(s_Slot, sizeof(void*), s_OldProtect, &s_OldProtect);
+            return s_Old;
+        }
+    }
+    return nullptr;
+}
+
+void NoMoreAltF4::InstallSendRequestHook()
+{
+    s_OriginalSendRequest = PatchIAT(&NoMoreAltF4::HookedSendRequest);
+    if (s_OriginalSendRequest)
+        Logger::Info("[NoMoreAltF4] WinHttpSendRequest IAT hook installed.");
+    else
+        Logger::Warn("[NoMoreAltF4] WinHttpSendRequest not found in IAT — POST body logging unavailable.");
+}
+
+void NoMoreAltF4::RemoveSendRequestHook()
+{
+    if (s_OriginalSendRequest)
+    {
+        PatchIAT(s_OriginalSendRequest); // restore original
+        s_OriginalSendRequest = nullptr;
     }
 }
 
-void NoMoreAltF4::OnFrameUpdate(const SGameUpdateEvent &p_UpdateEvent) {
-    // This function is called every frame while the game is in play mode.
+// The replacement function: inspect, log, and optionally block POST requests.
+// The body in lpOptional is plain UTF-8 JSON — IOI does not encrypt it.
+//
+// Blocking strategy (learned from packet captures):
+//   - ContractFailed is sent via SaveEvents2 in the values[] array.
+//   - SaveAndSynchronizeEvents4 is then called with empty values[] to sync.
+//   - The server derives SegmentClosing from the previously-sent ContractFailed.
+//   - Therefore: block any SaveEvents2 body containing "ContractFailed",
+//     and block SaveAndSynchronizeEvents4 entirely while network kill is active.
+//   - We return TRUE (success) without calling the original, so the game
+//     believes the request succeeded — no retry loops.
+BOOL WINAPI NoMoreAltF4::HookedSendRequest(
+    HINTERNET hRequest, LPCWSTR pwszHeaders, DWORD dwHeadersLength,
+    LPVOID lpOptional, DWORD dwOptionalLength,
+    DWORD dwTotalLength, DWORD_PTR dwContext)
+{
+    auto* s_Plugin = Plugin();
+
+    // Build body string once for both logging and blocking checks.
+    std::string s_Body;
+    if (s_Plugin && lpOptional && dwOptionalLength > 0)
+        s_Body.assign(reinterpret_cast<const char*>(lpOptional), dwOptionalLength);
+
+    // --- Diagnostic logging ---
+    if (s_Plugin && s_Plugin->m_LogHttpRequests && !s_Body.empty())
+    {
+        std::string s_LogBody = s_Body;
+        constexpr size_t k_MaxLog = 1024;
+        if (s_LogBody.size() > k_MaxLog)
+        {
+            s_LogBody.resize(k_MaxLog);
+            s_LogBody += "...";
+        }
+        Logger::Info("[NoMoreAltF4] HTTP POST body: {}", s_LogBody);
+    }
+
+    // --- Death detection + network blocking ---
+    // ContractFailed detection happens here (in the POST body) because:
+    //   - OnEventReceived only fires for server→client events (e.g. SegmentClosing)
+    //   - OnEventSent fires for client→server events but only gives an opaque index
+    //   - The HTTP POST body is where we can actually read event names
+    if (s_Plugin && s_Plugin->ShouldProtect() && hRequest && !s_Body.empty()
+        && s_Body.find("\"ContractFailed\"") != std::string::npos)
+    {
+        Logger::Warn("[NoMoreAltF4] ContractFailed detected in HTTP body — death/failure!");
+        s_Plugin->m_DeathDetected = true;
+
+        // If auto-kill is enabled, kill immediately (fastest path)
+        if (s_Plugin->m_AutoKillEnabled)
+        {
+            Logger::Warn("[NoMoreAltF4] Auto-killing from HTTP hook.");
+            s_Plugin->KillProcess();
+            return TRUE; // unreachable after TerminateProcess, but keeps compiler happy
+        }
+
+        // Even without auto-kill, block the request if network blocking is enabled
+        if (s_Plugin->m_BlockNetworkOnDeath)
+        {
+            Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing ContractFailed.");
+            s_Plugin->m_NetworkBlocked = true;
+            return TRUE; // fake success
+        }
+    }
+
+    // --- Network blocking (after KillProcess or manual block) ---
+    if (s_Plugin && s_Plugin->m_NetworkBlocked && hRequest)
+    {
+        wchar_t s_UrlBuf[2048] = {};
+        DWORD s_UrlLen = sizeof(s_UrlBuf);
+        if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, s_UrlBuf, &s_UrlLen))
+        {
+            std::wstring s_Url(s_UrlBuf);
+
+            // Block SaveAndSynchronizeEvents4 entirely — it triggers SegmentClosing.
+            if (s_Url.find(L"SaveAndSynchronizeEvents4") != std::wstring::npos)
+            {
+                Logger::Warn("[NoMoreAltF4] BLOCKED SaveAndSynchronizeEvents4 (network kill active).");
+                return TRUE;
+            }
+
+            // Block any remaining SaveEvents2 with failure data.
+            if (s_Url.find(L"SaveEvents2") != std::wstring::npos
+                && !s_Body.empty()
+                && s_Body.find("\"ContractFailed\"") != std::string::npos)
+            {
+                Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing ContractFailed.");
+                return TRUE;
+            }
+        }
+    }
+
+    return s_OriginalSendRequest(
+        hRequest, pwszHeaders, dwHeadersLength,
+        lpOptional, dwOptionalLength, dwTotalLength, dwContext);
 }
 
-DEFINE_PLUGIN_DETOUR(NoMoreAltF4, bool, OnLoadScene, ZEntitySceneContext* th, SSceneInitParameters& p_Parameters) {
-    Logger::Debug("Loading scene: {}", p_Parameters.m_SceneResource);
-    return { HookAction::Continue() };
+// =============================================================================
+// Network Interception
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// ZAchievementManagerSimple_OnEventReceived
+//
+// Fires when the game receives an event FROM THE SERVER (e.g. SegmentClosing).
+// This does NOT fire for client-side events like ContractFailed — those go
+// through OnEventSent and the HTTP layer.
+//
+// When network kill is active, we block server-side events like SegmentClosing
+// to prevent the game from processing the failure confirmation.
+// -----------------------------------------------------------------------------
+DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceived,
+    ZAchievementManagerSimple* th, const SOnlineEvent& event)
+{
+    const char* s_Name = event.sName.c_str();
+
+    if (m_LogHttpRequests)
+        Logger::Info("[NoMoreAltF4] Event received (server→client): {}", s_Name);
+
+    // Block server-side events when network kill is active
+    if (m_NetworkBlocked)
+    {
+        Logger::Warn("[NoMoreAltF4] Blocking server event '{}' (network kill active).", s_Name);
+        return HookAction::Return();
+    }
+
+    // Block SegmentClosing even if network kill hasn't been set yet —
+    // this is the server's confirmation of mission failure
+    if (m_DeathDetected && strcmp(s_Name, "SegmentClosing") == 0)
+    {
+        Logger::Warn("[NoMoreAltF4] Blocking SegmentClosing (death detected, protecting state).");
+        return HookAction::Return();
+    }
+
+    return HookAction::Continue();
 }
 
-DECLARE_ZHM_PLUGIN(NoMoreAltF4);
+// -----------------------------------------------------------------------------
+// ZAchievementManagerSimple_OnEventSent
+//
+// Fires when the game dispatches an online event to IOI's servers (kills,
+// mission outcomes, Elusive Target results, etc.).  This is the highest-level
+// interception point — returning early drops the event before any HTTP call is
+// ever initiated, which is earlier and safer than WinHTTP-level cancellation.
+//
+// When m_NetworkBlocked is true (set in KillProcess) we swallow the event so
+// the ET/mission failure is never recorded server-side.
+// -----------------------------------------------------------------------------
+DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventSent,
+    ZAchievementManagerSimple* th, uint32_t eventIndex, const ZDynamicObject& event)
+{
+    if (m_NetworkBlocked)
+    {
+        Logger::Warn("[NoMoreAltF4] Blocking online event #{} (network kill active).", eventIndex);
+        return HookAction::Return();
+    }
+
+    if (m_LogHttpRequests)
+        Logger::Info("[NoMoreAltF4] Online event sent: index={}", eventIndex);
+
+    return HookAction::Continue(); // framework calls original
+}
+
+// -----------------------------------------------------------------------------
+// Http_WinHttpCallback
+//
+// Fires on every WinHTTP status change for the game's HTTP requests.
+// At WINHTTP_CALLBACK_STATUS_SENDING_REQUEST (0x10) the request is about to be
+// sent — this is where we log the full URL when diagnostic mode is on.
+//
+// We cannot cancel a WinHTTP request from within its own callback (Microsoft
+// docs advise against calling WinHttp functions from callbacks), so this hook
+// is logging-only.  The ZAchievementManagerSimple hook above is the actual
+// blocking mechanism.
+// -----------------------------------------------------------------------------
+DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, Http_WinHttpCallback,
+    void* dwContext, void* hInternet, void* param_3, int dwInternetStatus,
+    void* param_5, int param_6)
+{
+    // WINHTTP_CALLBACK_STATUS_SENDING_REQUEST = 0x00000010
+    // At this status the request handle is valid and WinHttpQueryOption(URL) works.
+    // We inspect the URL when either logging is enabled OR network kill is active
+    // (to detect any gap in ZAchievementManagerSimple coverage).
+    if (dwInternetStatus == WINHTTP_CALLBACK_STATUS_SENDING_REQUEST && hInternet
+        && (m_LogHttpRequests || m_NetworkBlocked))
+    {
+        wchar_t s_UrlBuf[2048] = {};
+        DWORD s_UrlLen = sizeof(s_UrlBuf);
+        if (WinHttpQueryOption(static_cast<HINTERNET>(hInternet), WINHTTP_OPTION_URL, s_UrlBuf, &s_UrlLen))
+        {
+            // Narrow-convert: IOI API URLs are ASCII-safe.
+            std::string s_Url(s_UrlBuf, s_UrlBuf + wcslen(s_UrlBuf));
+
+            if (m_LogHttpRequests)
+                Logger::Info("[NoMoreAltF4] HTTP Sending: {}", s_Url);
+
+            // SaveAndSynchronizeEvents4 is the session-close packet that records
+            // contract outcomes including ET failures. If it fires while we're in
+            // network-kill mode, our ZAchievementManagerSimple block didn't catch
+            // the SegmentClosing event in time. Log a warning so this gap is visible.
+            if (m_NetworkBlocked && s_Url.find("SaveAndSynchronizeEvents4") != std::string::npos)
+                Logger::Error("[NoMoreAltF4] WARNING: SaveAndSynchronizeEvents4 reached HTTP layer "
+                              "despite network kill — event block may not have fired in time.");
+        }
+    }
+
+    return HookAction::Continue(); // framework calls original
+}
+
+// -----------------------------------------------------------------------------
+// ZHttpResultDynamicObject_OnBufferReady
+//
+// Fires when an HTTP response body is fully received.  Used in diagnostic mode
+// to log response content so you can identify exactly which API endpoints IOI
+// uses for mission/ET outcomes.
+// -----------------------------------------------------------------------------
+DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZHttpResultDynamicObject_OnBufferReady,
+    ZHttpResultDynamicObject* th)
+{
+    if (m_LogHttpRequests && th)
+    {
+        const auto* s_Data = static_cast<const char*>(th->m_buffer.data());
+        const auto  s_Size = th->m_buffer.size();
+
+        if (s_Data && s_Size > 0)
+        {
+            // Truncate very large responses in the log.
+            constexpr uint32_t k_MaxLog = 512;
+            std::string s_Body(s_Data, s_Data + (s_Size < k_MaxLog ? s_Size : k_MaxLog));
+            Logger::Info("[NoMoreAltF4] HTTP Response ({} bytes): {}{}", s_Size, s_Body,
+                s_Size > k_MaxLog ? "..." : "");
+        }
+    }
+
+    return HookAction::Continue(); // framework calls original
+}
+
+// =============================================================================
+// ImGui Settings Panel (ZHMModSDK Overlay Menu)
+// =============================================================================
+
+void NoMoreAltF4::OnDrawMenu()
+{
+    if (ImGui::BeginMenu(ICON_MD_SHIELD " NoMoreAltF4"))
+    {
+        // --- Protection settings ---
+        if (ImGui::Checkbox("Terminate Game Process on Death/Failure", &m_AutoKillEnabled))
+        {
+            SetSettingBool(S_SETTINGS_SECTION, "AutoKillEnabled", m_AutoKillEnabled);
+            Logger::Info("[NoMoreAltF4] Terminate on failure: {}", m_AutoKillEnabled ? "ON" : "OFF");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Kill the game process when a mission fails.\n"
+                              "Prevents failure from being saved to IOI servers.\n"
+                              "Protects Freelancer items and Elusive Target retries.");
+
+        if (ImGui::Checkbox("Block Outgoing Mission Failure Messages", &m_BlockNetworkOnDeath))
+        {
+            SetSettingBool(S_SETTINGS_SECTION, "BlockNetworkOnDeath", m_BlockNetworkOnDeath);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Intercept ContractFailed network events before they\n"
+                              "reach IOI servers. Active even if auto-terminate is off.");
+
+        ImGui::Separator();
+
+        // --- Scope ---
+        if (ImGui::Checkbox("Only Enable for Freelancer", &m_FreelancerOnly))
+        {
+            SetSettingBool(S_SETTINGS_SECTION, "FreelancerOnly", m_FreelancerOnly);
+            Logger::Info("[NoMoreAltF4] Freelancer only: {}", m_FreelancerOnly ? "ON" : "OFF");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("When enabled, all protection is limited to Freelancer mode.\n"
+                              "Other game modes (ETs, contracts, etc.) are unaffected.\n"
+                              "When disabled, protection is active in all modes.");
+
+        ImGui::Separator();
+
+        // --- Abort hotkey ---
+        const char* keyName = "F9";
+        switch (m_ManualKillKey)
+        {
+        case VK_F9:  keyName = "F9"; break;
+        case VK_F10: keyName = "F10"; break;
+        case VK_F11: keyName = "F11"; break;
+        case VK_F12: keyName = "F12"; break;
+        default:     keyName = "Custom"; break;
+        }
+        ImGui::Text("Manual abort hotkey: %s (0x%X)", keyName, m_ManualKillKey);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Press this key to instantly abort the mission.\nUse when spotted or about to fail.");
+
+        if (ImGui::SmallButton("F9")) { m_ManualKillKey = VK_F9;  SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("F10")) { m_ManualKillKey = VK_F10; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("F11")) { m_ManualKillKey = VK_F11; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("F12")) { m_ManualKillKey = VK_F12; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+
+        ImGui::Separator();
+
+        // --- Debug ---
+        if (ImGui::Checkbox("Log HTTP requests", &m_LogHttpRequests))
+        {
+            SetSettingBool(S_SETTINGS_SECTION, "LogHttpRequests", m_LogHttpRequests);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Log all outgoing IOI HTTP request URLs and response bodies\n"
+                              "to the ZHMModSDK log. Use this to identify which endpoints\n"
+                              "handle Elusive Target / mission results.");
+
+        ImGui::Separator();
+
+        // --- Status ---
+        if (m_Initialized)
+        {
+            bool s_Protected = ShouldProtect();
+            if (s_Protected)
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), ICON_MD_SHIELD " Protection active");
+            else
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), ICON_MD_SHIELD " Protection inactive (not Freelancer)");
+
+            const char* s_Mode = "---";
+            if (IsFreelancerMode())
+                s_Mode = "Freelancer";
+            else if (SDK()->GetLocalPlayer())
+                s_Mode = "Standard";
+            ImGui::Text("Mode: %s", s_Mode);
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), ICON_MD_HOURGLASS_EMPTY " Waiting for engine...");
+        }
+
+        ImGui::EndMenu();
+    }
+}

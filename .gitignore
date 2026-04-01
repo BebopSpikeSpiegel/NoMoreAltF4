@@ -377,3 +377,6 @@ FodyWeavers.xsd
 
 out/
 CMakeUserPresets.json
+
+# Claude Code
+.claude/
