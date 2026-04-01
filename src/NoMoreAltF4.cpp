@@ -1,4 +1,4 @@
-#include "MyMod.h"
+#include "NoMoreAltF4.h"
 
 #include <Logging.h>
 #include <IconsMaterialDesign.h>
@@ -7,48 +7,48 @@
 #include <Glacier/ZGameLoopManager.h>
 #include <Glacier/ZScene.h>
 
-void MyMod::OnEngineInitialized() {
-    Logger::Info("MyMod has been initialized!");
+void NoMoreAltF4::OnEngineInitialized() {
+    Logger::Info("NoMoreAltF4 has been initialized!");
 
     // Register a function to be called on every game frame while the game is in play mode.
-    const ZMemberDelegate<MyMod, void(const SGameUpdateEvent&)> s_Delegate(this, &MyMod::OnFrameUpdate);
+    const ZMemberDelegate<NoMoreAltF4, void(const SGameUpdateEvent&)> s_Delegate(this, &NoMoreAltF4::OnFrameUpdate);
     Globals::GameLoopManager->RegisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 
     // Install a hook to print the name of the scene every time the game loads a new one.
-    Hooks::ZEntitySceneContext_LoadScene->AddDetour(this, &MyMod::OnLoadScene);
+    Hooks::ZEntitySceneContext_LoadScene->AddDetour(this, &NoMoreAltF4::OnLoadScene);
 }
 
-MyMod::~MyMod() {
+NoMoreAltF4::~NoMoreAltF4() {
     // Unregister our frame update function when the mod unloads.
-    const ZMemberDelegate<MyMod, void(const SGameUpdateEvent&)> s_Delegate(this, &MyMod::OnFrameUpdate);
+    const ZMemberDelegate<NoMoreAltF4, void(const SGameUpdateEvent&)> s_Delegate(this, &NoMoreAltF4::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 }
 
-void MyMod::OnDrawMenu() {
+void NoMoreAltF4::OnDrawMenu() {
     // Toggle our message when the user presses our button.
-    if (ImGui::Button(ICON_MD_LOCAL_FIRE_DEPARTMENT " MyMod")) {
+    if (ImGui::Button(ICON_MD_LOCAL_FIRE_DEPARTMENT " NoMoreAltF4")) {
         m_ShowMessage = !m_ShowMessage;
     }
 }
 
-void MyMod::OnDrawUI(bool p_HasFocus) {
+void NoMoreAltF4::OnDrawUI(bool p_HasFocus) {
     if (m_ShowMessage) {
         // Show a window for our mod.
-        if (ImGui::Begin("MyMod", &m_ShowMessage)) {
+        if (ImGui::Begin("NoMoreAltF4", &m_ShowMessage)) {
             // Only show these when the window is expanded.
-            ImGui::Text("Hello from MyMod!");
+            ImGui::Text("Hello from NoMoreAltF4!");
         }
         ImGui::End();
     }
 }
 
-void MyMod::OnFrameUpdate(const SGameUpdateEvent &p_UpdateEvent) {
+void NoMoreAltF4::OnFrameUpdate(const SGameUpdateEvent &p_UpdateEvent) {
     // This function is called every frame while the game is in play mode.
 }
 
-DEFINE_PLUGIN_DETOUR(MyMod, bool, OnLoadScene, ZEntitySceneContext* th, SSceneInitParameters& p_Parameters) {
+DEFINE_PLUGIN_DETOUR(NoMoreAltF4, bool, OnLoadScene, ZEntitySceneContext* th, SSceneInitParameters& p_Parameters) {
     Logger::Debug("Loading scene: {}", p_Parameters.m_SceneResource);
     return { HookAction::Continue() };
 }
 
-DECLARE_ZHM_PLUGIN(MyMod);
+DECLARE_ZHM_PLUGIN(NoMoreAltF4);
