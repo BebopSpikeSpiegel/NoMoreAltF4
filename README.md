@@ -1,10 +1,10 @@
 # NoMoreAltF4
 
-A [ZHMModSDK](https://github.com/OrfeasZ/ZHMModSDK) plugin for Hitman: World of Assassination that automates the Alt-F4 exploit to prevent mission failure penalties.
+A [ZHMModSDK](https://github.com/OrfeasZ/ZHMModSDK) plugin for Hitman: World of Assassination that automates the Alt-F4 exploit to prevent mission failure penalties. Specifically designed for **Freelancer** and **Elusive Targets** — the two modes where failure has permanent consequences.
 
 ## What It Does
 
-In Freelancer mode (and optionally all modes), dying or failing a mission means losing your carried items, campaign progress, and safehouse inventory. The classic workaround is to Alt-F4 before the game saves — this plugin automates that timing perfectly.
+In Freelancer mode, dying means losing your carried items, campaign progress, and safehouse inventory. In Elusive Targets, a single failure locks you out permanently. The classic workaround is to Alt-F4 before the game saves — this plugin automates that timing perfectly.
 
 ### Features
 
