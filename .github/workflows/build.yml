@@ -88,33 +88,14 @@ jobs:
 
     - name: Archive artifact files
       run: |
-        cd NoMoreAltF4-Debug
-        zip -r NoMoreAltF4-Debug.zip *
-        cd ../NoMoreAltF4-Release
-        zip -r NoMoreAltF4-Release.zip *
+        cd NoMoreAltF4-Debug && zip -r ../NoMoreAltF4-Debug.zip * && cd ..
+        cd NoMoreAltF4-Release && zip -r ../NoMoreAltF4-Release.zip * && cd ..
 
-    - name: Get release
-      id: get_release
-      uses: bruceadams/get-release@v1.2.2
+    - name: Upload assets to release
       env:
-        GITHUB_TOKEN: ${{ github.token }}
-
-    - name: Upload debug assets
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.get_release.outputs.upload_url }}
-        asset_path: NoMoreAltF4-Debug/NoMoreAltF4-Debug.zip
-        asset_name: NoMoreAltF4-Debug.zip
-        asset_content_type: application/zip
-
-    - name: Upload release assets
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.get_release.outputs.upload_url }}
-        asset_path: NoMoreAltF4-Release/NoMoreAltF4-Release.zip
-        asset_name: NoMoreAltF4-Release.zip
-        asset_content_type: application/zip
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release upload "${{ github.event.release.tag_name }}" \
+          NoMoreAltF4-Debug.zip \
+          NoMoreAltF4-Release.zip \
+          --repo "${{ github.repository }}"
