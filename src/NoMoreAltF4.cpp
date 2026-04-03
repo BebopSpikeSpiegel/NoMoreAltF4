@@ -408,6 +408,17 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     if (s_Plugin && s_Plugin->ShouldProtect() && hRequest && !s_Body.empty()
         && s_Body.find("\"ContractFailed\"") != std::string::npos)
     {
+        // Player-initiated restarts send ContractFailed with OnRestartLevel/OnReplanLevel.
+        // These are intentional — let them through so restart/replan works normally.
+        if (s_Body.find("OnRestartLevel") != std::string::npos
+            || s_Body.find("OnReplanLevel") != std::string::npos
+            || s_Body.find("OnLoadGame") != std::string::npos)
+        {
+            Logger::Info("[NoMoreAltF4] ContractFailed is a manual restart/replan — allowing.");
+            return s_OriginalSendRequest(hRequest, pwszHeaders, dwHeadersLength,
+                lpOptional, dwOptionalLength, dwTotalLength, dwContext);
+        }
+
         Logger::Warn("[NoMoreAltF4] ContractFailed detected in HTTP body — death/failure!");
         s_Plugin->m_DeathDetected = true;
 
