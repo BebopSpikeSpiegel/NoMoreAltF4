@@ -101,7 +101,7 @@ jobs:
           --repo "${{ github.repository }}"
 
     - name: Upload Debug to Nexus Mods
-      uses: Nexus-Mods/upload-action@v1
+      uses: Nexus-Mods/upload-action@v1.0.0-beta.3
       with:
         api_key: ${{ secrets.NEXUSMODS_API_KEY }}
         file_group_id: 7254587
@@ -111,7 +111,7 @@ jobs:
         file_category: main
 
     - name: Upload Release to Nexus Mods
-      uses: Nexus-Mods/upload-action@v1
+      uses: Nexus-Mods/upload-action@v1.0.0-beta.3
       with:
         api_key: ${{ secrets.NEXUSMODS_API_KEY }}
         file_group_id: 7260392
