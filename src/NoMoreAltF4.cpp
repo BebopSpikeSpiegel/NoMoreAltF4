@@ -40,6 +40,7 @@ void NoMoreAltF4::Init()
     m_ManualKillKey        = static_cast<int>(GetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", 0));
     m_BlockNetworkOnDeath  = GetSettingBool(S_SETTINGS_SECTION, "BlockNetworkOnDeath",  true);
     m_LogHttpRequests      = GetSettingBool(S_SETTINGS_SECTION, "LogHttpRequests",      true);
+    m_AllowExitToMenu      = GetSettingBool(S_SETTINGS_SECTION, "AllowExitToMenu",      false);
 
     Logger::Info("[NoMoreAltF4] Plugin loaded. Auto-kill: {}, Freelancer-only: {}, Hotkey: 0x{:X}, BlockNet: {}, LogHTTP: {}",
         m_AutoKillEnabled, m_FreelancerOnly, m_ManualKillKey, m_BlockNetworkOnDeath, m_LogHttpRequests);
@@ -408,13 +409,14 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     if (s_Plugin && s_Plugin->ShouldProtect() && hRequest && !s_Body.empty()
         && s_Body.find("\"ContractFailed\"") != std::string::npos)
     {
-        // Player-initiated restarts send ContractFailed with OnRestartLevel/OnReplanLevel.
-        // These are intentional — let them through so restart/replan works normally.
+        // Player-initiated actions send ContractFailed with specific Value strings.
+        // These are intentional — let them through so restart/replan/load/exit works normally.
         if (s_Body.find("OnRestartLevel") != std::string::npos
             || s_Body.find("OnReplanLevel") != std::string::npos
-            || s_Body.find("OnLoadGame") != std::string::npos)
+            || s_Body.find("OnLoadGame") != std::string::npos
+            || (s_Plugin->m_AllowExitToMenu && s_Body.find("exit to Main menu") != std::string::npos))
         {
-            Logger::Info("[NoMoreAltF4] ContractFailed is a manual restart/replan — allowing.");
+            Logger::Info("[NoMoreAltF4] ContractFailed is a manual action (restart/replan/load/exit) — allowing.");
             return s_OriginalSendRequest(hRequest, pwszHeaders, dwHeadersLength,
                 lpOptional, dwOptionalLength, dwTotalLength, dwContext);
         }
@@ -650,6 +652,17 @@ void NoMoreAltF4::OnDrawMenu()
             ImGui::SetTooltip("When enabled, all protection is limited to Freelancer mode.\n"
                               "Other game modes (ETs, contracts, etc.) are unaffected.\n"
                               "When disabled, protection is active in all modes.");
+
+        if (ImGui::Checkbox("Allow Exit to Main Menu", &m_AllowExitToMenu))
+        {
+            SetSettingBool(S_SETTINGS_SECTION, "AllowExitToMenu", m_AllowExitToMenu);
+            Logger::Info("[NoMoreAltF4] Allow exit to menu: {}", m_AllowExitToMenu ? "ON" : "OFF");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("When enabled, exiting to main menu during a mission is allowed\n"
+                              "without being blocked. When disabled, exit-to-menu is treated\n"
+                              "as a potential failure event and blocked.\n"
+                              "WARNING: In Freelancer/ET, exiting to menu counts as a failure!");
 
         ImGui::Separator();
 

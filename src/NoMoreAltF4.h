@@ -57,6 +57,7 @@ private:
     bool m_FreelancerOnly = false;
     bool m_Initialized = false;
     bool m_PlayerWasInMission = false;            // For resetting death flag on mission entry
+    bool m_AllowExitToMenu = false;               // Allow "Exit to Main Menu" ContractFailed events through
 
     // --- Hotkey ---
     int m_ManualKillKey = 0;              // Default: None (0 = disabled)
