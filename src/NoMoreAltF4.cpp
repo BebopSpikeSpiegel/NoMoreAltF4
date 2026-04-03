@@ -25,6 +25,7 @@ static const ZString S_SETTINGS_SECTION = "NoMoreAltF4";
 
 // Static storage for the original WinHttpSendRequest pointer (pre-hook).
 NoMoreAltF4::FnWinHttpSendRequest NoMoreAltF4::s_OriginalSendRequest = nullptr;
+std::atomic<bool> NoMoreAltF4::s_HookPassthrough{ false };
 
 // =============================================================================
 // Initialization
@@ -36,7 +37,7 @@ void NoMoreAltF4::Init()
     // Settings API: GetSettingBool(section, name, defaultValue)
     m_AutoKillEnabled      = GetSettingBool(S_SETTINGS_SECTION, "AutoKillEnabled",      true);
     m_FreelancerOnly       = GetSettingBool(S_SETTINGS_SECTION, "FreelancerOnly",       false);
-    m_ManualKillKey        = static_cast<int>(GetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", VK_F9));
+    m_ManualKillKey        = static_cast<int>(GetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", 0));
     m_BlockNetworkOnDeath  = GetSettingBool(S_SETTINGS_SECTION, "BlockNetworkOnDeath",  true);
     m_LogHttpRequests      = GetSettingBool(S_SETTINGS_SECTION, "LogHttpRequests",      true);
 
@@ -49,6 +50,7 @@ void NoMoreAltF4::OnEngineInitialized()
     Logger::Info("[NoMoreAltF4] Engine initialized. Death detection active.");
     m_Initialized = true;
     m_WasAlive = false;
+    s_HookPassthrough = false;
 
     // Register SDK event/network hooks.
     Hooks::ZAchievementManagerSimple_OnEventReceived->AddDetour(this, &NoMoreAltF4::ZAchievementManagerSimple_OnEventReceived);
@@ -62,16 +64,14 @@ void NoMoreAltF4::OnEngineInitialized()
 
 NoMoreAltF4::~NoMoreAltF4()
 {
-    // Remove SDK detours registered with this plugin instance.
-    Hooks::ZAchievementManagerSimple_OnEventReceived->RemoveDetoursWithContext(this);
-    Hooks::ZAchievementManagerSimple_OnEventSent->RemoveDetoursWithContext(this);
-    Hooks::Http_WinHttpCallback->RemoveDetoursWithContext(this);
-    Hooks::ZHttpResultDynamicObject_OnBufferReady->RemoveDetoursWithContext(this);
-
-    // Restore original WinHttpSendRequest.
+    // Make IAT hook a passthrough, then swap IAT to persistent JMP stub
+    // so in-flight WinHttpSendRequest calls don't land in freed DLL memory.
+    s_HookPassthrough = true;
     RemoveSendRequestHook();
 
-    Logger::Info("[NoMoreAltF4] Plugin unloaded.");
+    // SDK detour cleanup is left to the framework (sample mods don't
+    // call RemoveDetoursWithContext — the SDK handles it on plugin unload).
+    // See: https://github.com/OrfeasZ/ZHMModSDK/issues/XXX
 }
 
 // =============================================================================
@@ -84,17 +84,20 @@ void NoMoreAltF4::OnDrawUI(bool p_HasFocus)
         return;
 
     // --- Manual hotkey check (edge-triggered: fires once on key down) ---
-    bool keyDown = (GetAsyncKeyState(m_ManualKillKey) & 0x8000) != 0;
-    if (keyDown && !m_ManualKillKeyPrevState)
+    if (m_ManualKillKey != 0)
     {
-        if (ShouldProtect())
+        bool keyDown = (GetAsyncKeyState(m_ManualKillKey) & 0x8000) != 0;
+        if (keyDown && !m_ManualKillKeyPrevState)
         {
-            Logger::Warn("[NoMoreAltF4] Manual abort triggered (hotkey 0x{:X}). Terminating.", m_ManualKillKey);
-            KillProcess();
-            return;
+            if (ShouldProtect())
+            {
+                Logger::Warn("[NoMoreAltF4] Manual abort triggered (hotkey 0x{:X}). Terminating.", m_ManualKillKey);
+                KillProcess();
+                return;
+            }
         }
+        m_ManualKillKeyPrevState = keyDown;
     }
-    m_ManualKillKeyPrevState = keyDown;
 
     // --- Reset death detection on new mission entry ---
     {
@@ -271,20 +274,86 @@ static NoMoreAltF4::FnWinHttpSendRequest PatchIAT(NoMoreAltF4::FnWinHttpSendRequ
     return nullptr;
 }
 
+// Persistent trampoline stub allocated via VirtualAlloc.
+// This tiny block of executable memory survives DLL unload and simply
+// forwards all WinHttpSendRequest calls to the original function.
+// When our DLL IS loaded and s_HookPassthrough is false, HookedSendRequest
+// does the real work. When the DLL unloads, s_HookPassthrough is set to
+// true by the destructor, and HookedSendRequest (still reachable because
+// the IAT points here) calls the original immediately.
+//
+// Layout of persistent data (heap-allocated, never freed):
+//   PersistentHookData { original_fn, passthrough_flag, hook_fn }
+// The IAT is patched to point at a VirtualAlloc'd thunk that reads these.
+//
+// HOWEVER — the simplest safe approach for x64 where we can't easily
+// write position-independent thunks: we leave our static HookedSendRequest
+// in the IAT while loaded, and on unload we restore the IAT to the
+// original function. The crash happens because of in-flight calls.
+//
+// REAL FIX: On unload, patch the IAT to a VirtualAlloc'd stub that
+// just does `jmp [original]`. This stub is 14 bytes of machine code
+// and a pointer, allocated once and never freed.
+
+// Persistent stub — allocated once, never freed, survives DLL unload.
+static void* s_PersistentStub = nullptr;
+static NoMoreAltF4::FnWinHttpSendRequest* s_PersistentOrigPtr = nullptr;
+
+static NoMoreAltF4::FnWinHttpSendRequest CreatePersistentJmpStub(NoMoreAltF4::FnWinHttpSendRequest p_Original)
+{
+    // Allocate executable memory: 14 bytes for `jmp [rip+0]` + 8 bytes for the pointer
+    // This memory is intentionally never freed — it must outlive the DLL.
+    constexpr size_t k_StubSize = 32;
+    auto* s_Mem = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, k_StubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!s_Mem)
+        return nullptr;
+
+    // x64: FF 25 00 00 00 00 = jmp qword ptr [rip+0]  (jumps to the address stored right after)
+    s_Mem[0] = 0xFF;
+    s_Mem[1] = 0x25;
+    s_Mem[2] = 0x00;
+    s_Mem[3] = 0x00;
+    s_Mem[4] = 0x00;
+    s_Mem[5] = 0x00;
+    // The 8-byte target address immediately follows
+    memcpy(s_Mem + 6, &p_Original, sizeof(p_Original));
+
+    // Store pointer to the address slot so we can update it if needed
+    s_PersistentOrigPtr = reinterpret_cast<NoMoreAltF4::FnWinHttpSendRequest*>(s_Mem + 6);
+
+    DWORD s_OldProtect;
+    VirtualProtect(s_Mem, k_StubSize, PAGE_EXECUTE_READ, &s_OldProtect);
+
+    return reinterpret_cast<NoMoreAltF4::FnWinHttpSendRequest>(s_Mem);
+}
+
 void NoMoreAltF4::InstallSendRequestHook()
 {
+    // Create the persistent stub first — this will be what the IAT points to
+    // after DLL unload, so it must exist before we install anything.
     s_OriginalSendRequest = PatchIAT(&NoMoreAltF4::HookedSendRequest);
     if (s_OriginalSendRequest)
+    {
+        s_PersistentStub = reinterpret_cast<void*>(
+            CreatePersistentJmpStub(s_OriginalSendRequest));
         Logger::Info("[NoMoreAltF4] WinHttpSendRequest IAT hook installed.");
+    }
     else
+    {
         Logger::Warn("[NoMoreAltF4] WinHttpSendRequest not found in IAT — POST body logging unavailable.");
+    }
 }
 
 void NoMoreAltF4::RemoveSendRequestHook()
 {
-    if (s_OriginalSendRequest)
+    // Instead of restoring the original function pointer (which races with
+    // in-flight calls), patch the IAT to point at the persistent JMP stub.
+    // The stub lives in VirtualAlloc'd memory that survives DLL unload and
+    // simply jumps to the real WinHttpSendRequest.
+    if (s_PersistentStub && s_OriginalSendRequest)
     {
-        PatchIAT(s_OriginalSendRequest); // restore original
+        PatchIAT(reinterpret_cast<FnWinHttpSendRequest>(s_PersistentStub));
         s_OriginalSendRequest = nullptr;
     }
 }
@@ -305,6 +374,12 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     LPVOID lpOptional, DWORD dwOptionalLength,
     DWORD dwTotalLength, DWORD_PTR dwContext)
 {
+    // During shutdown, skip all logic and call the original directly.
+    // This prevents accessing freed plugin memory while in-flight calls drain.
+    if (s_HookPassthrough)
+        return s_OriginalSendRequest(hRequest, pwszHeaders, dwHeadersLength,
+            lpOptional, dwOptionalLength, dwTotalLength, dwContext);
+
     auto* s_Plugin = Plugin();
 
     // Build body string once for both logging and blocking checks.
@@ -568,19 +643,25 @@ void NoMoreAltF4::OnDrawMenu()
         ImGui::Separator();
 
         // --- Abort hotkey ---
-        const char* keyName = "F9";
+        const char* keyName = "None";
         switch (m_ManualKillKey)
         {
+        case 0:      keyName = "None"; break;
         case VK_F9:  keyName = "F9"; break;
         case VK_F10: keyName = "F10"; break;
         case VK_F11: keyName = "F11"; break;
         case VK_F12: keyName = "F12"; break;
         default:     keyName = "Custom"; break;
         }
-        ImGui::Text("Manual abort hotkey: %s (0x%X)", keyName, m_ManualKillKey);
+        if (m_ManualKillKey != 0)
+            ImGui::Text("Manual abort hotkey: %s (0x%X)", keyName, m_ManualKillKey);
+        else
+            ImGui::Text("Manual abort hotkey: None (disabled)");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Press this key to instantly abort the mission.\nUse when spotted or about to fail.");
 
+        if (ImGui::SmallButton("None")) { m_ManualKillKey = 0;     SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        ImGui::SameLine();
         if (ImGui::SmallButton("F9")) { m_ManualKillKey = VK_F9;  SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
         ImGui::SameLine();
         if (ImGui::SmallButton("F10")) { m_ManualKillKey = VK_F10; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }

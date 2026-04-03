@@ -59,7 +59,7 @@ private:
     bool m_PlayerWasInMission = false;            // For resetting death flag on mission entry
 
     // --- Hotkey ---
-    int m_ManualKillKey = VK_F9;          // Default: F9
+    int m_ManualKillKey = 0;              // Default: None (0 = disabled)
     bool m_ManualKillKeyPrevState = false; // Edge detection
 
     // --- Network blocking ---
@@ -72,6 +72,7 @@ private:
     // --- WinHttpSendRequest manual hook ---
     void InstallSendRequestHook();
     void RemoveSendRequestHook();
+    static std::atomic<bool> s_HookPassthrough;  // When true, HookedSendRequest just calls original
 
 public:
     // Public so the free-function PatchIAT helper can use the typedef.
