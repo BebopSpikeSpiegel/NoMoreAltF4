@@ -10,7 +10,9 @@ In Freelancer mode, dying means losing your carried items, campaign progress, an
 
 - **Auto-terminate on death/failure** — Detects `ContractFailed` events in outgoing network traffic and kills the game process before the failure is saved to IOI servers. Protects carried items, safehouse items, and campaign progress.
 - **Block outgoing failure messages** — Intercepts and drops mission failure packets at multiple layers (game event system, HTTP POST body inspection via IAT hook) so the server never receives them.
-- **Manual abort hotkey (F9)** — Force-quit the mission at any time (spotted, lost Silent Assassin, etc.) with a single keypress. Configurable in the mod menu.
+- **Smart event filtering** — Player-initiated actions like restarting, replanning, and loading saves are automatically allowed through — only actual deaths and failures are blocked.
+- **Allow Exit to Main Menu** (toggle, off by default) — Exiting to main menu during Freelancer or ET missions counts as a failure, so it's blocked unless you explicitly enable this option in the mod menu.
+- **Manual abort hotkey** — Force-quit the mission at any time (spotted, lost Silent Assassin, etc.) with a single keypress. Configurable in the mod menu (None, F9, F10, F11, F12). Disabled by default to avoid conflicts with Nvidia overlay.
 - **Freelancer detection** — Identifies Freelancer mode via scene path ("Evergreen" codename). Optional "Only Enable for Freelancer" toggle disables all protection in non-Freelancer missions.
 - **Elusive Target protection** — Works for ET failures too (wrong kill method, objective failure) — not just player death.
 
@@ -42,7 +44,8 @@ Open the ZHMModSDK overlay menu (`~` key) to access settings:
 | Terminate Game Process on Death/Failure | On | Auto-kill the process when a failure event is detected |
 | Block Outgoing Mission Failure Messages | On | Drop failure packets without terminating |
 | Only Enable for Freelancer | Off | Restrict all protection to Freelancer mode only |
-| Manual abort hotkey | F9 | Hotkey to force-quit the mission manually |
+| Allow Exit to Main Menu | Off | Allow exiting to main menu without blocking (risky in Freelancer/ET) |
+| Manual abort hotkey | None | Hotkey to force-quit the mission manually (None, F9–F12) |
 | Log HTTP requests | On | Log all IOI HTTP traffic for diagnostics |
 
 ## Building
