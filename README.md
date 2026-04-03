@@ -68,7 +68,7 @@ See the [ZHMModSDK wiki](https://github.com/OrfeasZ/ZHMModSDK/wiki) for detailed
 
 ## License
 
-[MIT](LICENSE)
+[GPL v3](LICENSE)
 
 ## See Also
 
