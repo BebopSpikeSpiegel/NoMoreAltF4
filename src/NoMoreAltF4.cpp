@@ -443,21 +443,27 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     // Detect failure events in outgoing SaveEvents2 POST bodies.
     // The game sends different events depending on the type of failure:
     //   - MissionFailed_Event / MissionWounded_Event — actual player death
-    //   - MildChess_MissionFailed — Freelancer-specific failure flag in CpdSet
+    //   - MildChess_MissionFailed — Freelancer-specific failure event
     //   - ContractFailed — manual actions (exit-to-menu, restart, replan, load)
     //     Note: ContractFailed does NOT appear in outgoing bodies on actual death;
     //     on death the game sends MissionFailed_Event etc. instead.
+    //
+    // IMPORTANT: Match "Name":"EventName" (the JSON key-value pair), NOT just
+    // the bare event name.  CpdSet events include field names like
+    // "MildChess_MissionFailed" inside their Value object — matching the bare
+    // string causes false positives on normal mission completion.
     if (s_Plugin && s_Plugin->ShouldProtect() && hRequest && !s_Body.empty())
     {
         // Check for actual death/failure events (these ONLY fire on real death)
+        // Must match as event Name, not as a field name inside CpdSet values.
         bool s_HasDeathEvent =
-            s_Body.find("\"MissionFailed_Event\"") != std::string::npos
-            || s_Body.find("\"MissionWounded_Event\"") != std::string::npos
-            || s_Body.find("\"MildChess_MissionFailed\"") != std::string::npos;
+            s_Body.find("\"Name\":\"MissionFailed_Event\"") != std::string::npos
+            || s_Body.find("\"Name\":\"MissionWounded_Event\"") != std::string::npos
+            || s_Body.find("\"Name\":\"MildChess_MissionFailed\"") != std::string::npos;
 
         // Check for ContractFailed (manual exit, restart, replan, etc.)
         bool s_HasContractFailed =
-            s_Body.find("\"ContractFailed\"") != std::string::npos;
+            s_Body.find("\"Name\":\"ContractFailed\"") != std::string::npos;
 
         if (s_HasDeathEvent || s_HasContractFailed)
         {
@@ -515,12 +521,13 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
             }
 
             // Block any remaining SaveEvents2 with failure data.
+            // Match "Name":"EventName" to avoid false positives from CpdSet field names.
             if (s_Url.find(L"SaveEvents2") != std::wstring::npos && !s_Body.empty())
             {
-                if (s_Body.find("\"ContractFailed\"") != std::string::npos
-                    || s_Body.find("\"MissionFailed_Event\"") != std::string::npos
-                    || s_Body.find("\"MissionWounded_Event\"") != std::string::npos
-                    || s_Body.find("\"MildChess_MissionFailed\"") != std::string::npos)
+                if (s_Body.find("\"Name\":\"ContractFailed\"") != std::string::npos
+                    || s_Body.find("\"Name\":\"MissionFailed_Event\"") != std::string::npos
+                    || s_Body.find("\"Name\":\"MissionWounded_Event\"") != std::string::npos
+                    || s_Body.find("\"Name\":\"MildChess_MissionFailed\"") != std::string::npos)
                 {
                     Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing failure data.");
                     return TRUE;
@@ -542,13 +549,8 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
 // ZAchievementManagerSimple_OnEventReceived
 //
 // Fires when the game receives an event FROM THE SERVER (e.g. SegmentClosing,
-// ContractFailed).  ContractFailed arrives here as a server confirmation after
-// the game sends MissionFailed_Event etc. via SaveEvents2.
-//
-// This hook serves as a backup detection path: if the HTTP body check missed
-// the failure, catching ContractFailed here still triggers protection.
-// When network kill is active, we block all server events to prevent the
-// game from processing the failure confirmation.
+// ContractFailed).  When network kill is active, we block all server events
+// to prevent the game from processing the failure confirmation.
 // -----------------------------------------------------------------------------
 DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceived,
     ZAchievementManagerSimple* th, const SOnlineEvent& event)
@@ -558,30 +560,10 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceive
     if (m_LogHttpRequests)
         Logger::Info("[NoMoreAltF4] Event received (server→client): {}", s_Name);
 
-    // ContractFailed arriving from the server means IOI confirmed the failure.
-    // This is a backup detection path — if our HTTP body check missed it,
-    // catch it here and trigger protection.
-    //
-    // IMPORTANT: Only trigger when the player is actually in a mission.
-    // At startup, SaveAndSynchronizeEvents4 replays the previous session's
-    // ContractFailed event — we must ignore that or we'll kill the game
-    // before it even loads.
-    if (ShouldProtect() && strcmp(s_Name, "ContractFailed") == 0
-        && !m_DeathDetected && m_PlayerWasInMission)
-    {
-        Logger::Warn("[NoMoreAltF4] ContractFailed received from server — death/failure confirmed!");
-        m_DeathDetected = true;
-
-        if (m_AutoKillEnabled)
-        {
-            Logger::Warn("[NoMoreAltF4] TERMINATED — auto-kill from server event.");
-            KillProcess();
-            return HookAction::Return();
-        }
-
-        if (m_BlockNetworkOnDeath)
-            m_NetworkBlocked = true;
-    }
+    // NOTE: Server-side ContractFailed is just a confirmation of what we already
+    // catch on the outgoing side (HTTP body / OnEventSent).  We do NOT trigger
+    // protection from it because SaveAndSynchronizeEvents4 replays the previous
+    // session's ContractFailed at startup, which would crash the game.
 
     // Block server-side events when network kill is active
     if (m_NetworkBlocked)
