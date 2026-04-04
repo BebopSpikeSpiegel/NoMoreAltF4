@@ -52,7 +52,8 @@ private:
 
     // --- State ---
     std::atomic<bool> m_WasAlive{ false };
-    std::atomic<bool> m_DeathDetected{ false };  // Set by OnEventReceived on ContractFailed
+    std::atomic<bool> m_DeathDetected{ false };  // Set by HookedSendRequest on death events
+    std::atomic<bool> m_FreelancerDetected{ false }; // Set when "Evergreen" events seen in HTTP traffic
     bool m_AutoKillEnabled = true;
     bool m_FreelancerOnly = false;
     bool m_Initialized = false;

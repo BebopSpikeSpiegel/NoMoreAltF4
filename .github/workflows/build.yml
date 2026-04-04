@@ -109,6 +109,13 @@ jobs:
         version: ${{ github.event.release.tag_name }}
         display_name: "NoMoreAltF4 Debug ${{ github.event.release.tag_name }}"
         file_category: main
+        description: |
+          Pops up a debug terminal on start.
+
+          NoMoreAltF4 ${{ github.event.release.tag_name }} — ZHMModSDK plugin that automates the Alt-F4 exploit to prevent mission failure penalties in Freelancer and Elusive Targets.
+
+          Changelog:
+          ${{ github.event.release.body }}
 
     - name: Upload Release to Nexus Mods
       uses: Nexus-Mods/upload-action@v1.0.0-beta.3
@@ -119,3 +126,8 @@ jobs:
         version: ${{ github.event.release.tag_name }}
         display_name: "NoMoreAltF4 Release ${{ github.event.release.tag_name }}"
         file_category: main
+        description: |
+          NoMoreAltF4 ${{ github.event.release.tag_name }} — ZHMModSDK plugin that automates the Alt-F4 exploit to prevent mission failure penalties in Freelancer and Elusive Targets.
+
+          Changelog:
+          ${{ github.event.release.body }}

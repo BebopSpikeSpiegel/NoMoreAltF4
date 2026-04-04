@@ -107,8 +107,16 @@ void NoMoreAltF4::OnDrawUI(bool p_HasFocus)
 
         if (s_InMission && !m_PlayerWasInMission)
         {
-            // Just entered a mission — clear stale death flag
+            // Just entered a mission — clear stale flags
             m_DeathDetected = false;
+            // Note: m_FreelancerDetected is NOT reset here — it persists across
+            // missions within the same Freelancer campaign. It's only reset when
+            // the player leaves a mission (below), so it re-detects on next entry.
+        }
+        if (!s_InMission && m_PlayerWasInMission)
+        {
+            // Left a mission — reset Freelancer flag so it re-detects next time
+            m_FreelancerDetected = false;
         }
         m_PlayerWasInMission = s_InMission;
     }
@@ -141,13 +149,13 @@ void NoMoreAltF4::OnDrawUI(bool p_HasFocus)
 // Uses a hybrid approach:
 //   1. SDK()->GetLocalPlayer() — returns TEntityRef<ZHitman5>, null when not
 //      in a mission (main menu, loading, etc.). Null = safe, don't trigger.
-//   2. m_DeathDetected flag — set by ZAchievementManagerSimple_OnEventReceived
-//      when a "ContractFailed" event fires. This is the game's own signal that
-//      the player died / mission failed.
+//   2. m_DeathDetected flag — set by HookedSendRequest when it detects failure
+//      events (MissionFailed_Event, MissionWounded_Event, MildChess_MissionFailed)
+//      in outgoing HTTP POST bodies, or by OnEventReceived when the server sends
+//      back a ContractFailed confirmation.
 //
 // ZHitman5 does not inherit IActor (which has IsDead()/IsAlive()), and does
-// not expose an alive/dead field directly in the SDK headers. The event-based
-// approach is reliable because ContractFailed IS the death event in Freelancer.
+// not expose an alive/dead field directly in the SDK headers.
 
 bool NoMoreAltF4::IsPlayerAlive() const
 {
@@ -168,11 +176,22 @@ bool NoMoreAltF4::IsPlayerAlive() const
 // =============================================================================
 //
 // Freelancer mode uses the internal codename "Evergreen" throughout Glacier 2.
-// All Freelancer scenes (safehouse + missions) include "Evergreen" in the
-// scene path stored in ZContractsManager::SContractContext::m_sScene.
+// Detection uses two methods:
+//   1. Scene path check — some Freelancer scenes contain "Evergreen" in the path
+//   2. HTTP event detection — Freelancer missions send events with "Evergreen" in
+//      the name (Evergreen_MissionPayout, EvergreenMissionStarted, etc.) and use
+//      ContractType "evergreen". This is set by HookedSendRequest.
+// Method 2 is needed because actual Freelancer mission scenes use regular map
+// paths (e.g. miami/scene_flamingo_hot_pinochle.entity), not "Evergreen" paths.
 
 bool NoMoreAltF4::IsFreelancerMode() const
 {
+    // Method 1: HTTP event detection (most reliable — "Evergreen" appears in
+    // event names and contract types in every Freelancer session)
+    if (m_FreelancerDetected)
+        return true;
+
+    // Method 2: Scene path check (fallback)
     auto* s_ContractsManager = Globals::ContractsManager;
     if (!s_ContractsManager)
         return false;
@@ -181,7 +200,6 @@ bool NoMoreAltF4::IsFreelancerMode() const
     if (s_Scene.size() == 0)
         return false;
 
-    // "Evergreen" is IOI's internal codename for Freelancer mode
     return strstr(s_Scene.c_str(), "Evergreen") != nullptr;
 }
 
@@ -363,10 +381,14 @@ void NoMoreAltF4::RemoveSendRequestHook()
 // The body in lpOptional is plain UTF-8 JSON — IOI does not encrypt it.
 //
 // Blocking strategy (learned from packet captures):
-//   - ContractFailed is sent via SaveEvents2 in the values[] array.
-//   - SaveAndSynchronizeEvents4 is then called with empty values[] to sync.
-//   - The server derives SegmentClosing from the previously-sent ContractFailed.
-//   - Therefore: block any SaveEvents2 body containing "ContractFailed",
+//   - On actual death, the game sends MissionFailed_Event, MissionWounded_Event,
+//     and MildChess_MissionFailed via SaveEvents2 POST bodies.
+//   - ContractFailed is sent outgoing only for manual actions (exit-to-menu,
+//     restart, replan). On death, ContractFailed only appears as a server→client
+//     response event, not in outgoing POST bodies.
+//   - SaveAndSynchronizeEvents4 is then called to sync — the server derives
+//     SegmentClosing from the previously-sent failure events.
+//   - Therefore: block SaveEvents2 bodies containing any failure event,
 //     and block SaveAndSynchronizeEvents4 entirely while network kill is active.
 //   - We return TRUE (success) without calling the original, so the game
 //     believes the request succeeded — no retry loops.
@@ -401,43 +423,78 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
         Logger::Info("[NoMoreAltF4] HTTP POST body: {}", s_LogBody);
     }
 
-    // --- Death detection + network blocking ---
-    // ContractFailed detection happens here (in the POST body) because:
-    //   - OnEventReceived only fires for server→client events (e.g. SegmentClosing)
-    //   - OnEventSent fires for client→server events but only gives an opaque index
-    //   - The HTTP POST body is where we can actually read event names
-    if (s_Plugin && s_Plugin->ShouldProtect() && hRequest && !s_Body.empty()
-        && s_Body.find("\"ContractFailed\"") != std::string::npos)
+    // --- Freelancer mode detection ---
+    // Freelancer events contain "Evergreen" in event names (e.g. Evergreen_MissionPayout,
+    // EvergreenMissionStarted) and ContractType "evergreen". The scene path does NOT
+    // contain "Evergreen" — actual missions use regular map paths.
+    // IMPORTANT: Match "Evergreen_" (with underscore) or "EvergreenMission" specifically,
+    // NOT just "Evergreen" — because Actor_Kill events in ALL modes contain
+    // "EvergreenRarity" which would cause false Freelancer detection.
+    if (s_Plugin && !s_Plugin->m_FreelancerDetected && !s_Body.empty()
+        && (s_Body.find("\"Evergreen_") != std::string::npos
+            || s_Body.find("\"EvergreenMission") != std::string::npos
+            || s_Body.find("\"ContractType\":\"evergreen\"") != std::string::npos))
     {
-        // Player-initiated actions send ContractFailed with specific Value strings.
-        // These are intentional — let them through so restart/replan/load/exit works normally.
-        if (s_Body.find("OnRestartLevel") != std::string::npos
-            || s_Body.find("OnReplanLevel") != std::string::npos
-            || s_Body.find("OnLoadGame") != std::string::npos
-            || (s_Plugin->m_AllowExitToMenu && s_Body.find("exit to Main menu") != std::string::npos))
-        {
-            Logger::Info("[NoMoreAltF4] ContractFailed is a manual action (restart/replan/load/exit) — allowing.");
-            return s_OriginalSendRequest(hRequest, pwszHeaders, dwHeadersLength,
-                lpOptional, dwOptionalLength, dwTotalLength, dwContext);
-        }
+        Logger::Info("[NoMoreAltF4] Freelancer mode detected via Evergreen event in HTTP traffic.");
+        s_Plugin->m_FreelancerDetected = true;
+    }
 
-        Logger::Warn("[NoMoreAltF4] ContractFailed detected in HTTP body — death/failure!");
-        s_Plugin->m_DeathDetected = true;
+    // --- Death detection + network blocking ---
+    // Detect failure events in outgoing SaveEvents2 POST bodies.
+    // The game sends different events depending on the type of failure:
+    //   - MissionFailed_Event / MissionWounded_Event — actual player death
+    //   - MildChess_MissionFailed — Freelancer-specific failure flag in CpdSet
+    //   - ContractFailed — manual actions (exit-to-menu, restart, replan, load)
+    //     Note: ContractFailed does NOT appear in outgoing bodies on actual death;
+    //     on death the game sends MissionFailed_Event etc. instead.
+    if (s_Plugin && s_Plugin->ShouldProtect() && hRequest && !s_Body.empty())
+    {
+        // Check for actual death/failure events (these ONLY fire on real death)
+        bool s_HasDeathEvent =
+            s_Body.find("\"MissionFailed_Event\"") != std::string::npos
+            || s_Body.find("\"MissionWounded_Event\"") != std::string::npos
+            || s_Body.find("\"MildChess_MissionFailed\"") != std::string::npos;
 
-        // If auto-kill is enabled, kill immediately (fastest path)
-        if (s_Plugin->m_AutoKillEnabled)
-        {
-            Logger::Warn("[NoMoreAltF4] Auto-killing from HTTP hook.");
-            s_Plugin->KillProcess();
-            return TRUE; // unreachable after TerminateProcess, but keeps compiler happy
-        }
+        // Check for ContractFailed (manual exit, restart, replan, etc.)
+        bool s_HasContractFailed =
+            s_Body.find("\"ContractFailed\"") != std::string::npos;
 
-        // Even without auto-kill, block the request if network blocking is enabled
-        if (s_Plugin->m_BlockNetworkOnDeath)
+        if (s_HasDeathEvent || s_HasContractFailed)
         {
-            Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing ContractFailed.");
-            s_Plugin->m_NetworkBlocked = true;
-            return TRUE; // fake success
+            // ContractFailed without death events = player-initiated action.
+            // Check if it should be allowed through.
+            if (!s_HasDeathEvent && s_HasContractFailed)
+            {
+                if (s_Body.find("OnRestartLevel") != std::string::npos
+                    || s_Body.find("OnReplanLevel") != std::string::npos
+                    || s_Body.find("OnLoadGame") != std::string::npos
+                    || (s_Plugin->m_AllowExitToMenu && s_Body.find("exit to Main menu") != std::string::npos))
+                {
+                    Logger::Info("[NoMoreAltF4] ContractFailed is a manual action (restart/replan/load/exit) — allowing.");
+                    return s_OriginalSendRequest(hRequest, pwszHeaders, dwHeadersLength,
+                        lpOptional, dwOptionalLength, dwTotalLength, dwContext);
+                }
+            }
+
+            Logger::Warn("[NoMoreAltF4] Failure detected in HTTP body! Death events: {}, ContractFailed: {}",
+                s_HasDeathEvent, s_HasContractFailed);
+            s_Plugin->m_DeathDetected = true;
+
+            // If auto-kill is enabled, kill immediately (fastest path)
+            if (s_Plugin->m_AutoKillEnabled)
+            {
+                Logger::Warn("[NoMoreAltF4] TERMINATED — auto-kill from HTTP hook.");
+                s_Plugin->KillProcess();
+                return TRUE; // unreachable after TerminateProcess, but keeps compiler happy
+            }
+
+            // Even without auto-kill, block the request if network blocking is enabled
+            if (s_Plugin->m_BlockNetworkOnDeath)
+            {
+                Logger::Warn("[NoMoreAltF4] BLOCKED outgoing failure events.");
+                s_Plugin->m_NetworkBlocked = true;
+                return TRUE; // fake success
+            }
         }
     }
 
@@ -458,12 +515,16 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
             }
 
             // Block any remaining SaveEvents2 with failure data.
-            if (s_Url.find(L"SaveEvents2") != std::wstring::npos
-                && !s_Body.empty()
-                && s_Body.find("\"ContractFailed\"") != std::string::npos)
+            if (s_Url.find(L"SaveEvents2") != std::wstring::npos && !s_Body.empty())
             {
-                Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing ContractFailed.");
-                return TRUE;
+                if (s_Body.find("\"ContractFailed\"") != std::string::npos
+                    || s_Body.find("\"MissionFailed_Event\"") != std::string::npos
+                    || s_Body.find("\"MissionWounded_Event\"") != std::string::npos
+                    || s_Body.find("\"MildChess_MissionFailed\"") != std::string::npos)
+                {
+                    Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing failure data.");
+                    return TRUE;
+                }
             }
         }
     }
@@ -480,12 +541,14 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
 // -----------------------------------------------------------------------------
 // ZAchievementManagerSimple_OnEventReceived
 //
-// Fires when the game receives an event FROM THE SERVER (e.g. SegmentClosing).
-// This does NOT fire for client-side events like ContractFailed — those go
-// through OnEventSent and the HTTP layer.
+// Fires when the game receives an event FROM THE SERVER (e.g. SegmentClosing,
+// ContractFailed).  ContractFailed arrives here as a server confirmation after
+// the game sends MissionFailed_Event etc. via SaveEvents2.
 //
-// When network kill is active, we block server-side events like SegmentClosing
-// to prevent the game from processing the failure confirmation.
+// This hook serves as a backup detection path: if the HTTP body check missed
+// the failure, catching ContractFailed here still triggers protection.
+// When network kill is active, we block all server events to prevent the
+// game from processing the failure confirmation.
 // -----------------------------------------------------------------------------
 DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceived,
     ZAchievementManagerSimple* th, const SOnlineEvent& event)
@@ -494,6 +557,31 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceive
 
     if (m_LogHttpRequests)
         Logger::Info("[NoMoreAltF4] Event received (server→client): {}", s_Name);
+
+    // ContractFailed arriving from the server means IOI confirmed the failure.
+    // This is a backup detection path — if our HTTP body check missed it,
+    // catch it here and trigger protection.
+    //
+    // IMPORTANT: Only trigger when the player is actually in a mission.
+    // At startup, SaveAndSynchronizeEvents4 replays the previous session's
+    // ContractFailed event — we must ignore that or we'll kill the game
+    // before it even loads.
+    if (ShouldProtect() && strcmp(s_Name, "ContractFailed") == 0
+        && !m_DeathDetected && m_PlayerWasInMission)
+    {
+        Logger::Warn("[NoMoreAltF4] ContractFailed received from server — death/failure confirmed!");
+        m_DeathDetected = true;
+
+        if (m_AutoKillEnabled)
+        {
+            Logger::Warn("[NoMoreAltF4] TERMINATED — auto-kill from server event.");
+            KillProcess();
+            return HookAction::Return();
+        }
+
+        if (m_BlockNetworkOnDeath)
+            m_NetworkBlocked = true;
+    }
 
     // Block server-side events when network kill is active
     if (m_NetworkBlocked)
