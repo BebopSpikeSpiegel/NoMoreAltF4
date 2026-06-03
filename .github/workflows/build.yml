@@ -98,6 +98,7 @@ jobs:
         gh release upload "${{ github.event.release.tag_name }}" \
           NoMoreAltF4-Debug.zip \
           NoMoreAltF4-Release.zip \
+          --clobber \
           --repo "${{ github.repository }}"
 
     - name: Upload Debug to Nexus Mods
