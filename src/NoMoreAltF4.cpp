@@ -4,6 +4,7 @@
 #include <IconsMaterialDesign.h>
 #include <imgui.h>
 #include <Hooks.h>
+#include <Functions.h>
 #include <Globals.h>
 #include <Glacier/ZHttp.h>
 #include <Glacier/ZHitman5.h>
@@ -22,6 +23,30 @@ DEFINE_ZHM_PLUGIN(NoMoreAltF4);
 
 // Settings INI section name
 static const ZString S_SETTINGS_SECTION = "NoMoreAltF4";
+
+// Safety release valve: the maximum time a network block may stay active without
+// the process having terminated.  This bounds the "drop outgoing online events"
+// state so an unexpected event path can never leave the game stuck.
+static constexpr uint64_t k_NetworkBlockTimeoutMs = 8000;
+
+// Max bytes of an HTTP body/response written to the log. Set high (1 MB) so full
+// payloads are visible for diagnostics — only a pathologically huge body is
+// clipped. Logging is gated behind the "Log HTTP requests" toggle anyway.
+static constexpr size_t k_MaxLogBytes = 1u << 20;
+
+// IMPORTANT — why we NEVER short-circuit WinHttpSendRequest:
+//
+// The game drives WinHTTP asynchronously (it registers Http_WinHttpCallback).
+// If our IAT hook returns from WinHttpSendRequest WITHOUT calling the original:
+//   - returning TRUE  → no completion callback ever fires → the game's save/sync
+//                       state machine waits forever (the "game froze" report).
+//   - returning FALSE → the game's send-failed path dereferences a half-built
+//                       async context → access violation crash (0xC0000005).
+// Both are confirmed from user logs.  Therefore the WinHTTP hook is OBSERVE-ONLY:
+// it logs, detects, and may TerminateProcess (which is clean), but it always
+// otherwise calls the original.  Actual event suppression for block-only mode is
+// done at the game's own event layer (ZAchievementManagerSimple_OnEventSent),
+// which is the SDK-sanctioned, crash-safe interception point.
 
 // Static storage for the original WinHttpSendRequest pointer (pre-hook).
 NoMoreAltF4::FnWinHttpSendRequest NoMoreAltF4::s_OriginalSendRequest = nullptr;
@@ -100,25 +125,57 @@ void NoMoreAltF4::OnDrawUI(bool p_HasFocus)
         m_ManualKillKeyPrevState = keyDown;
     }
 
-    // --- Reset death detection on new mission entry ---
+    // --- Reset transient state on mission boundaries ---
     {
         auto s_LocalPlayer = SDK()->GetLocalPlayer();
         bool s_InMission = static_cast<bool>(s_LocalPlayer);
 
         if (s_InMission && !m_PlayerWasInMission)
         {
-            // Just entered a mission — clear stale flags
+            // Just entered a mission — clear stale flags.  Crucially, clear any
+            // network block left over from a previous contract: a block raised in
+            // an earlier mission must never leak into this one (e.g. dropping the
+            // legitimate success/sync traffic of the next mission and freezing it).
             m_DeathDetected = false;
+            m_NetworkBlocked = false;
+            m_NetworkBlockedAtMs = 0;
             // Note: m_FreelancerDetected is NOT reset here — it persists across
             // missions within the same Freelancer campaign. It's only reset when
             // the player leaves a mission (below), so it re-detects on next entry.
         }
         if (!s_InMission && m_PlayerWasInMission)
         {
-            // Left a mission — reset Freelancer flag so it re-detects next time
+            // Left a mission — reset all per-mission state so nothing leaks into
+            // the next one and the mode flags re-detect next time.
             m_FreelancerDetected = false;
+            m_ElusiveOrArcadeDetected = false;
+            m_DeathDetected = false;
+            m_NetworkBlocked = false;
+            m_NetworkBlockedAtMs = 0;
         }
         m_PlayerWasInMission = s_InMission;
+    }
+
+    // --- Safety release valve ---
+    // A network block must never persist indefinitely (it would freeze the game).
+    // In the normal flow the process is terminated within milliseconds of a block
+    // being raised, so this never fires; it only protects block-only mode and any
+    // unexpected event path from leaving the game permanently stuck.
+    if (m_NetworkBlocked)
+    {
+        const uint64_t s_Now = GetTickCount64();
+        const uint64_t s_Since = m_NetworkBlockedAtMs.load();
+        if (s_Since == 0)
+        {
+            m_NetworkBlockedAtMs = s_Now; // first frame we observed the block
+        }
+        else if (s_Now - s_Since > k_NetworkBlockTimeoutMs)
+        {
+            Logger::Warn("[NoMoreAltF4] Network block release valve fired after {} ms — clearing block to avoid a hang.",
+                s_Now - s_Since);
+            m_NetworkBlocked = false;
+            m_NetworkBlockedAtMs = 0;
+        }
     }
 
     // --- Auto-kill on death ---
@@ -220,7 +277,10 @@ void NoMoreAltF4::KillProcess()
     // to dispatch achievement events or HTTP requests get intercepted during the
     // brief window between this flag set and the OS actually killing the process.
     if (m_BlockNetworkOnDeath)
+    {
         m_NetworkBlocked = true;
+        m_NetworkBlockedAtMs = GetTickCount64();
+    }
 
     // TerminateProcess is used instead of ExitProcess because:
     // - ExitProcess runs DLL detach routines and atexit handlers, which could
@@ -380,18 +440,17 @@ void NoMoreAltF4::RemoveSendRequestHook()
 // The replacement function: inspect, log, and optionally block POST requests.
 // The body in lpOptional is plain UTF-8 JSON — IOI does not encrypt it.
 //
-// Blocking strategy (learned from packet captures):
-//   - On actual death, the game sends MissionFailed_Event, MissionWounded_Event,
-//     and MildChess_MissionFailed via SaveEvents2 POST bodies.
-//   - ContractFailed is sent outgoing only for manual actions (exit-to-menu,
-//     restart, replan). On death, ContractFailed only appears as a server→client
-//     response event, not in outgoing POST bodies.
-//   - SaveAndSynchronizeEvents4 is then called to sync — the server derives
-//     SegmentClosing from the previously-sent failure events.
-//   - Therefore: block SaveEvents2 bodies containing any failure event,
-//     and block SaveAndSynchronizeEvents4 entirely while network kill is active.
-//   - We return TRUE (success) without calling the original, so the game
-//     believes the request succeeded — no retry loops.
+// Role of this hook (learned from packet captures + crash/hang logs):
+//   - It is OBSERVE-ONLY for the request itself — it NEVER fakes the return value
+//     (see the note at the top of this file: faking TRUE hangs the game, faking
+//     FALSE crashes it).  It always either calls the original or TerminateProcess.
+//   - On death the game sends MissionFailed_Event / MissionWounded_Event /
+//     MildChess_MissionFailed; ET/Arcade/Freelancer failures send ContractFailed,
+//     all via SaveEvents2 POST bodies (ContractFailed also fires for manual
+//     restart/replan/load in normal contracts — filtered out below).
+//   - When a failure is seen here and auto-kill is on, we TerminateProcess before
+//     the original send, so the failure never reaches IOI.  In block-only mode the
+//     actual suppression is done earlier, at the event layer (OnEventSent).
 BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     HINTERNET hRequest, LPCWSTR pwszHeaders, DWORD dwHeadersLength,
     LPVOID lpOptional, DWORD dwOptionalLength,
@@ -414,10 +473,9 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     if (s_Plugin && s_Plugin->m_LogHttpRequests && !s_Body.empty())
     {
         std::string s_LogBody = s_Body;
-        constexpr size_t k_MaxLog = 1024;
-        if (s_LogBody.size() > k_MaxLog)
+        if (s_LogBody.size() > k_MaxLogBytes)
         {
-            s_LogBody.resize(k_MaxLog);
+            s_LogBody.resize(k_MaxLogBytes);
             s_LogBody += "...";
         }
         Logger::Info("[NoMoreAltF4] HTTP POST body: {}", s_LogBody);
@@ -437,6 +495,20 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     {
         Logger::Info("[NoMoreAltF4] Freelancer mode detected via Evergreen event in HTTP traffic.");
         s_Plugin->m_FreelancerDetected = true;
+    }
+
+    // --- Elusive Target / Arcade detection ---
+    // ETs and Elusive Target Arcade are single-attempt modes (failing has a
+    // permanent/locking consequence), so a ContractFailed there is always a real
+    // failure we want to suppress — unlike normal contracts where ContractFailed
+    // also fires for legitimate restart/replan/load.  The contract metadata carries
+    // "ContractType":"arcade" (Arcade) or "elusive" (live ETs).
+    if (s_Plugin && !s_Plugin->m_ElusiveOrArcadeDetected && !s_Body.empty()
+        && (s_Body.find("\"ContractType\":\"arcade\"") != std::string::npos
+            || s_Body.find("\"ContractType\":\"elusive\"") != std::string::npos))
+    {
+        Logger::Info("[NoMoreAltF4] Elusive Target / Arcade mode detected via ContractType in HTTP traffic.");
+        s_Plugin->m_ElusiveOrArcadeDetected = true;
     }
 
     // --- Death detection + network blocking ---
@@ -486,7 +558,11 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
                 s_HasDeathEvent, s_HasContractFailed);
             s_Plugin->m_DeathDetected = true;
 
-            // If auto-kill is enabled, kill immediately (fastest path)
+            // Auto-kill is the only safe action: TerminateProcess runs BEFORE the
+            // original send, so the failure never reaches IOI and there is no
+            // WinHTTP state left to corrupt. This is a fallback to the earlier
+            // OnEventSent detection. We never fake this request's return value
+            // (faking TRUE hangs the game, FALSE crashes it — see the file header).
             if (s_Plugin->m_AutoKillEnabled)
             {
                 Logger::Warn("[NoMoreAltF4] TERMINATED — auto-kill from HTTP hook.");
@@ -494,45 +570,8 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
                 return TRUE; // unreachable after TerminateProcess, but keeps compiler happy
             }
 
-            // Even without auto-kill, block the request if network blocking is enabled
-            if (s_Plugin->m_BlockNetworkOnDeath)
-            {
-                Logger::Warn("[NoMoreAltF4] BLOCKED outgoing failure events.");
-                s_Plugin->m_NetworkBlocked = true;
-                return TRUE; // fake success
-            }
-        }
-    }
-
-    // --- Network blocking (after KillProcess or manual block) ---
-    if (s_Plugin && s_Plugin->m_NetworkBlocked && hRequest)
-    {
-        wchar_t s_UrlBuf[2048] = {};
-        DWORD s_UrlLen = sizeof(s_UrlBuf);
-        if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, s_UrlBuf, &s_UrlLen))
-        {
-            std::wstring s_Url(s_UrlBuf);
-
-            // Block SaveAndSynchronizeEvents4 entirely — it triggers SegmentClosing.
-            if (s_Url.find(L"SaveAndSynchronizeEvents4") != std::wstring::npos)
-            {
-                Logger::Warn("[NoMoreAltF4] BLOCKED SaveAndSynchronizeEvents4 (network kill active).");
-                return TRUE;
-            }
-
-            // Block any remaining SaveEvents2 with failure data.
-            // Match "Name":"EventName" to avoid false positives from CpdSet field names.
-            if (s_Url.find(L"SaveEvents2") != std::wstring::npos && !s_Body.empty())
-            {
-                if (s_Body.find("\"Name\":\"ContractFailed\"") != std::string::npos
-                    || s_Body.find("\"Name\":\"MissionFailed_Event\"") != std::string::npos
-                    || s_Body.find("\"Name\":\"MissionWounded_Event\"") != std::string::npos
-                    || s_Body.find("\"Name\":\"MildChess_MissionFailed\"") != std::string::npos)
-                {
-                    Logger::Warn("[NoMoreAltF4] BLOCKED SaveEvents2 containing failure data.");
-                    return TRUE;
-                }
-            }
+            Logger::Warn("[NoMoreAltF4] Failure seen at HTTP layer but 'Terminate on Death/Failure' is OFF — "
+                         "the failure WILL be saved (it cannot be blocked safely). Enable auto-terminate to protect.");
         }
     }
 
@@ -565,15 +604,27 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceive
     // protection from it because SaveAndSynchronizeEvents4 replays the previous
     // session's ContractFailed at startup, which would crash the game.
 
-    // Block server-side events when network kill is active
-    if (m_NetworkBlocked)
+    // When a network kill/block is active, drop the server's failure-confirmation
+    // events.  We deliberately only block the KNOWN failure/closing events rather
+    // than every server event: swallowing unrelated events (matchmaking, presence,
+    // config, etc.) can stall the game's own state machine, and the actual failure
+    // is already prevented on the outgoing side.  Letting unrelated events through
+    // is what keeps the game responsive instead of frozen.
+    const bool s_IsFailureEvent =
+        strcmp(s_Name, "SegmentClosing") == 0
+        || strcmp(s_Name, "ContractFailed") == 0
+        || strcmp(s_Name, "MissionFailed_Event") == 0
+        || strcmp(s_Name, "MissionWounded_Event") == 0
+        || strcmp(s_Name, "MildChess_MissionFailed") == 0;
+
+    if (m_NetworkBlocked && s_IsFailureEvent)
     {
-        Logger::Warn("[NoMoreAltF4] Blocking server event '{}' (network kill active).", s_Name);
+        Logger::Warn("[NoMoreAltF4] Blocking server failure event '{}' (network kill active).", s_Name);
         return HookAction::Return();
     }
 
     // Block SegmentClosing even if network kill hasn't been set yet —
-    // this is the server's confirmation of mission failure
+    // this is the server's confirmation of mission failure.
     if (m_DeathDetected && strcmp(s_Name, "SegmentClosing") == 0)
     {
         Logger::Warn("[NoMoreAltF4] Blocking SegmentClosing (death detected, protecting state).");
@@ -586,25 +637,104 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventReceive
 // -----------------------------------------------------------------------------
 // ZAchievementManagerSimple_OnEventSent
 //
-// Fires when the game dispatches an online event to IOI's servers (kills,
-// mission outcomes, Elusive Target results, etc.).  This is the highest-level
-// interception point — returning early drops the event before any HTTP call is
-// ever initiated, which is earlier and safer than WinHTTP-level cancellation.
+// Fires when the game dispatches an online event (kills, mission outcomes,
+// Elusive Target results, etc.) BEFORE it is batched into an HTTP request.  This
+// is the SDK-sanctioned, crash-safe place to suppress an event: returning
+// HookAction::Return() simply stops the game from dispatching it, with none of
+// the WinHTTP-corruption problems of short-circuiting WinHttpSendRequest.
 //
-// When m_NetworkBlocked is true (set in KillProcess) we swallow the event so
-// the ET/mission failure is never recorded server-side.
+// This is the PRIMARY protection point for block-only mode and an early,
+// reliable trigger for auto-kill.
 // -----------------------------------------------------------------------------
 DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventSent,
     ZAchievementManagerSimple* th, uint32_t eventIndex, const ZDynamicObject& event)
 {
+    // Protection already engaged — drop every outgoing online event so nothing
+    // about the failed session reaches IOI. Bounded by the release valve.
     if (m_NetworkBlocked)
     {
-        Logger::Warn("[NoMoreAltF4] Blocking online event #{} (network kill active).", eventIndex);
+        if (m_LogHttpRequests)
+            Logger::Warn("[NoMoreAltF4] Dropping outgoing online event #{} (protection active).", eventIndex);
         return HookAction::Return();
     }
 
+    // Serialize the event with the game's OWN serializer (the same text the game
+    // would POST). Used both for the diagnostic log below and for failure matching.
+    // ZDynamicObject's accessors aren't exported by the SDK, but
+    // ZDynamicObject_ToString is resolved at runtime; if it's unavailable we skip
+    // (the HTTP-body hook is the fallback) rather than crash.
+    std::string s_EventStr;
+    if ((m_LogHttpRequests || ShouldProtect())
+        && Functions::ZDynamicObject_ToString && Functions::ZDynamicObject_ToString->Exists())
+    {
+        ZString s_Json;
+        Functions::ZDynamicObject_ToString->Call(const_cast<ZDynamicObject*>(&event), s_Json);
+        s_EventStr.assign(s_Json.c_str(), s_Json.size());
+    }
+
     if (m_LogHttpRequests)
-        Logger::Info("[NoMoreAltF4] Online event sent: index={}", eventIndex);
+    {
+        if (s_EventStr.empty())
+            Logger::Info("[NoMoreAltF4] Online event sent: index={} (payload unavailable)", eventIndex);
+        else
+        {
+            std::string s_LogEvent = s_EventStr;
+            if (s_LogEvent.size() > k_MaxLogBytes)
+            {
+                s_LogEvent.resize(k_MaxLogBytes);
+                s_LogEvent += "...";
+            }
+            Logger::Info("[NoMoreAltF4] Online event sent: index={} payload={}", eventIndex, s_LogEvent);
+        }
+    }
+
+    if (ShouldProtect() && !s_EventStr.empty())
+    {
+        // Unambiguous player-death / failure events — always a real failure.
+        const bool s_DeathEvent =
+            s_EventStr.find("\"Name\":\"MissionFailed_Event\"") != std::string::npos
+            || s_EventStr.find("\"Name\":\"MissionWounded_Event\"") != std::string::npos
+            || s_EventStr.find("\"Name\":\"MildChess_MissionFailed\"") != std::string::npos;
+
+        // ContractFailed is also used by legitimate restart/replan/load in normal
+        // contracts (where the manual-action markers live in sibling events we
+        // can't see here), so only treat it as a protectable failure in the
+        // single-attempt modes this mod targets (Freelancer / Elusive Target /
+        // Arcade), where there is no legitimate mid-mission restart.
+        const bool s_ContractFailed =
+            s_EventStr.find("\"Name\":\"ContractFailed\"") != std::string::npos
+            && (IsFreelancerMode() || m_ElusiveOrArcadeDetected);
+
+        if (s_DeathEvent || s_ContractFailed)
+        {
+            // Honor the exit-to-menu opt-out.
+            if (!s_DeathEvent && s_ContractFailed && m_AllowExitToMenu
+                && s_EventStr.find("exit to Main menu") != std::string::npos)
+            {
+                Logger::Info("[NoMoreAltF4] ContractFailed is an allowed exit-to-menu — passing through.");
+                return HookAction::Continue();
+            }
+
+            Logger::Warn("[NoMoreAltF4] Failure event detected at OnEventSent (index={}, death={}, contractFailed={}).",
+                eventIndex, s_DeathEvent, s_ContractFailed);
+            m_DeathDetected = true;
+
+            // Termination is the ONLY reliable, crash-safe protection. It fires
+            // here — before the failure is dispatched or batched into a SaveEvents2
+            // POST — so the failure never leaves the machine. (The failure is saved
+            // via plain WinHTTP POSTs that cannot be suppressed without crashing or
+            // hanging the game, so there is no safe "don't close the game" path.)
+            if (m_AutoKillEnabled)
+            {
+                Logger::Warn("[NoMoreAltF4] TERMINATED — auto-kill from OnEventSent.");
+                KillProcess();
+                return HookAction::Return();
+            }
+
+            Logger::Warn("[NoMoreAltF4] Failure detected but 'Terminate on Death/Failure' is OFF — "
+                         "the failure will be saved and is NOT prevented. Enable auto-terminate to protect.");
+        }
+    }
 
     return HookAction::Continue(); // framework calls original
 }
@@ -672,11 +802,11 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZHttpResultDynamicObject_OnBufferReady,
 
         if (s_Data && s_Size > 0)
         {
-            // Truncate very large responses in the log.
-            constexpr uint32_t k_MaxLog = 512;
-            std::string s_Body(s_Data, s_Data + (s_Size < k_MaxLog ? s_Size : k_MaxLog));
+            // Clip only pathologically large responses (see k_MaxLogBytes).
+            const size_t s_LogSize = s_Size < k_MaxLogBytes ? s_Size : k_MaxLogBytes;
+            std::string s_Body(s_Data, s_Data + s_LogSize);
             Logger::Info("[NoMoreAltF4] HTTP Response ({} bytes): {}{}", s_Size, s_Body,
-                s_Size > k_MaxLog ? "..." : "");
+                s_Size > k_MaxLogBytes ? "..." : "");
         }
     }
 
@@ -698,17 +828,15 @@ void NoMoreAltF4::OnDrawMenu()
             Logger::Info("[NoMoreAltF4] Terminate on failure: {}", m_AutoKillEnabled ? "ON" : "OFF");
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Kill the game process when a mission fails.\n"
-                              "Prevents failure from being saved to IOI servers.\n"
-                              "Protects Freelancer items and Elusive Target retries.");
+            ImGui::SetTooltip("Kill the game process the instant a mission failure is detected,\n"
+                              "before it can be saved to IOI servers. This is the ONLY reliable,\n"
+                              "crash-safe protection — the failure is recorded via network requests\n"
+                              "that cannot be blocked without crashing or hanging the game.\n"
+                              "Protects Freelancer items and Elusive Target / Arcade attempts.");
 
-        if (ImGui::Checkbox("Block Outgoing Mission Failure Messages", &m_BlockNetworkOnDeath))
-        {
-            SetSettingBool(S_SETTINGS_SECTION, "BlockNetworkOnDeath", m_BlockNetworkOnDeath);
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Intercept ContractFailed network events before they\n"
-                              "reach IOI servers. Active even if auto-terminate is off.");
+        if (!m_AutoKillEnabled)
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f),
+                ICON_MD_WARNING " Protection OFF — failures will be saved.");
 
         ImGui::Separator();
 

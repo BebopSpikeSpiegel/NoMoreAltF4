@@ -54,6 +54,7 @@ private:
     std::atomic<bool> m_WasAlive{ false };
     std::atomic<bool> m_DeathDetected{ false };  // Set by HookedSendRequest on death events
     std::atomic<bool> m_FreelancerDetected{ false }; // Set when "Evergreen" events seen in HTTP traffic
+    std::atomic<bool> m_ElusiveOrArcadeDetected{ false }; // Set when ContractType "arcade"/"elusive" seen in HTTP traffic
     bool m_AutoKillEnabled = true;
     bool m_FreelancerOnly = false;
     bool m_Initialized = false;
@@ -70,6 +71,10 @@ private:
     bool m_BlockNetworkOnDeath = true;
     bool m_LogHttpRequests = true;        // Diagnostic: log all IOI HTTP traffic
     std::atomic<bool> m_NetworkBlocked{ false };
+    // Tick (GetTickCount64) at which the network block was first observed active.
+    // Drives the safety release valve in OnDrawUI so a block can never persist
+    // indefinitely and freeze the game. 0 = not currently timing a block.
+    std::atomic<uint64_t> m_NetworkBlockedAtMs{ 0 };
 
     // --- WinHttpSendRequest manual hook ---
     void InstallSendRequestHook();
