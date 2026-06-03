@@ -101,22 +101,25 @@ jobs:
           --clobber \
           --repo "${{ github.repository }}"
 
+    # Nexus's new versions endpoint 500s on the raw tag (leading "v") and on the
+    # full markdown release body (emoji/em-dashes). Use a sanitized semver-ish
+    # version and a short plain-ASCII description.
+    - name: Compute clean version
+      id: ver
+      run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+
     - name: Upload Debug to Nexus Mods
       uses: Nexus-Mods/upload-action@v1.0.0-beta.7
       with:
         api_key: ${{ secrets.NEXUSMODS_API_KEY }}
         file_group_id: 7254587
         filename: NoMoreAltF4-Debug.zip
-        version: ${{ github.event.release.tag_name }}
-        display_name: "NoMoreAltF4 Debug ${{ github.event.release.tag_name }}"
+        version: ${{ steps.ver.outputs.version }}
+        display_name: "NoMoreAltF4 Debug ${{ steps.ver.outputs.version }}"
         file_category: main
-        description: |
-          Pops up a debug terminal on start.
-
-          NoMoreAltF4 ${{ github.event.release.tag_name }} — ZHMModSDK plugin that automates the Alt-F4 exploit to prevent mission failure penalties in Freelancer and Elusive Targets.
-
-          Changelog:
-          ${{ github.event.release.body }}
+        description: "Debug build (opens a console window on launch). Auto-terminates the game on a Freelancer or Elusive Target failure so it is never saved. Built against ZHMModSDK v4.0.2 / game 3.260.0.0. Keep auto-terminate ON."
 
     - name: Upload Release to Nexus Mods
       uses: Nexus-Mods/upload-action@v1.0.0-beta.7
@@ -124,11 +127,7 @@ jobs:
         api_key: ${{ secrets.NEXUSMODS_API_KEY }}
         file_group_id: 7260392
         filename: NoMoreAltF4-Release.zip
-        version: ${{ github.event.release.tag_name }}
-        display_name: "NoMoreAltF4 Release ${{ github.event.release.tag_name }}"
+        version: ${{ steps.ver.outputs.version }}
+        display_name: "NoMoreAltF4 Release ${{ steps.ver.outputs.version }}"
         file_category: main
-        description: |
-          NoMoreAltF4 ${{ github.event.release.tag_name }} — ZHMModSDK plugin that automates the Alt-F4 exploit to prevent mission failure penalties in Freelancer and Elusive Targets.
-
-          Changelog:
-          ${{ github.event.release.body }}
+        description: "Auto-terminates the game on a Freelancer or Elusive Target failure so it is never saved. Built against ZHMModSDK v4.0.2 / game 3.260.0.0. Keep auto-terminate ON."
