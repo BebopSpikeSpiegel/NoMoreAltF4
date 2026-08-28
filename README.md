@@ -9,9 +9,9 @@ In Freelancer mode, dying means losing your carried items, campaign progress, an
 ### Features
 
 - **Auto-terminate on death/failure** — Detects the failure event the instant it is dispatched and kills the game process *before* it is saved to IOI servers. This is the only reliable, crash-safe protection: the failure is recorded by ordinary network requests that cannot be blocked without crashing or hanging the game, so terminating first is the one approach that always works. Protects carried items, safehouse items, campaign progress, and ET/Arcade attempts.
-- **Smart event filtering** — Player-initiated actions like restarting, replanning, and loading saves are automatically ignored; `ContractFailed` is only treated as a real failure in the single-attempt modes this mod targets (Freelancer / Elusive Target / Arcade).
+- **Smart event filtering** — Player-initiated actions (Restart Mission, Replan Mission, loading saves) are recognized by the reason the game embeds in the event and always pass through, even in Elusive Targets — only genuine failures trigger protection. `ContractFailed` is only treated as a real failure in the single-attempt modes this mod targets (Freelancer / Elusive Target / Arcade).
 - **Allow Exit to Main Menu** (toggle, off by default) — Exiting to main menu during Freelancer or ET missions counts as a failure, so it's blocked unless you explicitly enable this option in the mod menu.
-- **Manual abort hotkey** — Force-quit the mission at any time (spotted, lost Silent Assassin, etc.) with a single keypress. Configurable in the mod menu (None, F9, F10, F11, F12). Disabled by default to avoid conflicts with Nvidia overlay.
+- **Manual abort hotkey** — Force-quit the mission at any time (spotted, lost Silent Assassin, etc.) with a single keypress. Configurable in the mod menu (None, F9, F10, F11, F12; disabled by default). Presses with Alt or Win held are ignored, so recording combos like Alt+F9 (Nvidia overlay) can never trigger it — while Shift/Ctrl (sprint/crouch) still work mid-panic.
 - **Freelancer detection** — Identifies Freelancer mode via scene path ("Evergreen" codename). Optional "Only Enable for Freelancer" toggle disables all protection in non-Freelancer missions.
 - **Elusive Target protection** — Works for ET failures too (wrong kill method, objective failure) — not just player death.
 
@@ -29,7 +29,7 @@ All per-mission state is reset on mission entry/exit so nothing leaks between mi
 
 ## Compatibility
 
-Built against **ZHMModSDK v4.0.2** and game build **3.260.0.0**. Always run the ZHMModSDK version that matches your installed game version — a mismatch resolves engine functions at stale offsets and can hang or crash the game.
+Built against **ZHMModSDK v4.0.2** and **live-tested on game build 3.280.0.0 ("Season of the Herbalist")** — including on a real live Elusive Target, where ET detection, auto-terminate on a real failure, and the manual abort hotkey were all verified in actual play (terminated failures confirmed never reaching IOI's servers). Always run the ZHMModSDK version that matches your installed game version — a mismatch resolves engine functions at stale offsets and can hang or crash the game.
 
 ## Why This Works
 

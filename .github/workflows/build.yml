@@ -119,7 +119,7 @@ jobs:
         version: ${{ steps.ver.outputs.version }}
         display_name: "NoMoreAltF4 Debug ${{ steps.ver.outputs.version }}"
         file_category: main
-        description: "Debug build (opens a console window on launch). Auto-terminates the game on a Freelancer or Elusive Target failure so it is never saved. Built against ZHMModSDK v4.0.2 / game 3.260.0.0. Keep auto-terminate ON."
+        description: "Debug build (opens a console window on launch). Auto-terminates the game on a Freelancer or Elusive Target failure so it is never saved. Live-tested on game 3.280.0.0 (Season of the Herbalist) on a real Elusive Target, with ZHMModSDK v4.0.2. Keep auto-terminate ON."
 
     - name: Upload Release to Nexus Mods
       uses: Nexus-Mods/upload-action@v1.0.0-beta.7
@@ -130,4 +130,4 @@ jobs:
         version: ${{ steps.ver.outputs.version }}
         display_name: "NoMoreAltF4 Release ${{ steps.ver.outputs.version }}"
         file_category: main
-        description: "Auto-terminates the game on a Freelancer or Elusive Target failure so it is never saved. Built against ZHMModSDK v4.0.2 / game 3.260.0.0. Keep auto-terminate ON."
+        description: "Auto-terminates the game on a Freelancer or Elusive Target failure so it is never saved. Live-tested on game 3.280.0.0 (Season of the Herbalist) on a real Elusive Target, with ZHMModSDK v4.0.2. Keep auto-terminate ON."

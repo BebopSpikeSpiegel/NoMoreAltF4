@@ -14,6 +14,8 @@
 #include <Windows.h>
 #pragma comment(lib, "winhttp.lib")
 
+#include <zlib.h>
+
 // =============================================================================
 // SDK Plugin Registration
 // =============================================================================
@@ -21,8 +23,12 @@
 //   GetPluginInterface(), CompiledSdkVersion(), CompiledSdkAbiVersion()
 DEFINE_ZHM_PLUGIN(NoMoreAltF4);
 
-// Settings INI section name
-static const ZString S_SETTINGS_SECTION = "NoMoreAltF4";
+// Settings INI section name.
+// MUST be all-lowercase, as must every setting key: SDK v4.0.2's ModSettings
+// does case-SENSITIVE lookups against keys that mINI lowercases when the INI
+// file is written, so mixed-case names save fine but silently fail to load
+// on the next launch (every session would start with defaults).
+static const ZString S_SETTINGS_SECTION = "nomorealtf4";
 
 // Safety release valve: the maximum time a network block may stay active without
 // the process having terminated.  This bounds the "drop outgoing online events"
@@ -60,12 +66,12 @@ void NoMoreAltF4::Init()
 {
     // Load persisted settings from the plugin's INI file.
     // Settings API: GetSettingBool(section, name, defaultValue)
-    m_AutoKillEnabled      = GetSettingBool(S_SETTINGS_SECTION, "AutoKillEnabled",      true);
-    m_FreelancerOnly       = GetSettingBool(S_SETTINGS_SECTION, "FreelancerOnly",       false);
-    m_ManualKillKey        = static_cast<int>(GetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", 0));
-    m_BlockNetworkOnDeath  = GetSettingBool(S_SETTINGS_SECTION, "BlockNetworkOnDeath",  true);
-    m_LogHttpRequests      = GetSettingBool(S_SETTINGS_SECTION, "LogHttpRequests",      true);
-    m_AllowExitToMenu      = GetSettingBool(S_SETTINGS_SECTION, "AllowExitToMenu",      false);
+    m_AutoKillEnabled      = GetSettingBool(S_SETTINGS_SECTION, "autokillenabled",      true);
+    m_FreelancerOnly       = GetSettingBool(S_SETTINGS_SECTION, "freelanceronly",       false);
+    m_ManualKillKey        = static_cast<int>(GetSettingInt(S_SETTINGS_SECTION, "manualkillkey", 0));
+    m_BlockNetworkOnDeath  = GetSettingBool(S_SETTINGS_SECTION, "blocknetworkondeath",  true);
+    m_LogHttpRequests      = GetSettingBool(S_SETTINGS_SECTION, "loghttprequests",      true);
+    m_AllowExitToMenu      = GetSettingBool(S_SETTINGS_SECTION, "allowexittomenu",      false);
 
     Logger::Info("[NoMoreAltF4] Plugin loaded. Auto-kill: {}, Freelancer-only: {}, Hotkey: 0x{:X}, BlockNet: {}, LogHTTP: {}",
         m_AutoKillEnabled, m_FreelancerOnly, m_ManualKillKey, m_BlockNetworkOnDeath, m_LogHttpRequests);
@@ -115,7 +121,22 @@ void NoMoreAltF4::OnDrawUI(bool p_HasFocus)
         bool keyDown = (GetAsyncKeyState(m_ManualKillKey) & 0x8000) != 0;
         if (keyDown && !m_ManualKillKeyPrevState)
         {
-            if (ShouldProtect())
+            // Ignore presses that are part of an Alt/Win combination (e.g. a
+            // screen recorder's Alt+F9) — those belong to other tools, not an
+            // abort request.  Shift/Ctrl are deliberately NOT excluded: they
+            // are sprint/crouch, which a panicking player may be holding while
+            // pressing the abort key.
+            const bool s_AltOrWinHeld =
+                (GetAsyncKeyState(VK_MENU) & 0x8000) != 0
+                || (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0
+                || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+
+            if (s_AltOrWinHeld)
+            {
+                Logger::Info("[NoMoreAltF4] Hotkey 0x{:X} pressed with Alt/Win held — ignoring (combination belongs to another tool).",
+                    m_ManualKillKey);
+            }
+            else if (ShouldProtect())
             {
                 Logger::Warn("[NoMoreAltF4] Manual abort triggered (hotkey 0x{:X}). Terminating.", m_ManualKillKey);
                 KillProcess();
@@ -281,6 +302,13 @@ void NoMoreAltF4::KillProcess()
         m_NetworkBlocked = true;
         m_NetworkBlockedAtMs = GetTickCount64();
     }
+
+    // Flush all SDK loggers so the detection/TERMINATED lines logged just
+    // before this call actually reach ZHMModLoader.log — spdlog's file sink
+    // is buffered, and TerminateProcess discards anything unflushed.
+    const auto s_Loggers = GetLoggers();
+    for (size_t i = 0; i < s_Loggers.Count; ++i)
+        s_Loggers.Loggers[i]->flush();
 
     // TerminateProcess is used instead of ExitProcess because:
     // - ExitProcess runs DLL detach routines and atexit handlers, which could
@@ -488,13 +516,30 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     // IMPORTANT: Match "Evergreen_" (with underscore) or "EvergreenMission" specifically,
     // NOT just "Evergreen" — because Actor_Kill events in ALL modes contain
     // "EvergreenRarity" which would cause false Freelancer detection.
-    if (s_Plugin && !s_Plugin->m_FreelancerDetected && !s_Body.empty()
-        && (s_Body.find("\"Evergreen_") != std::string::npos
-            || s_Body.find("\"EvergreenMission") != std::string::npos
-            || s_Body.find("\"ContractType\":\"evergreen\"") != std::string::npos))
+    if (s_Plugin && !s_Plugin->m_FreelancerDetected && !s_Body.empty())
     {
-        Logger::Info("[NoMoreAltF4] Freelancer mode detected via Evergreen event in HTTP traffic.");
-        s_Plugin->m_FreelancerDetected = true;
+        // "Evergreen_"-prefixed events are Freelancer-specific EXCEPT
+        // Evergreen_SecurityCameraDestroyed, which the game emits in EVERY
+        // mode (observed live on an Elusive Target, game 3.280) — skip it.
+        static constexpr char k_CrossModeEvent[] = "\"Evergreen_SecurityCameraDestroyed";
+        bool s_HasEvergreenEvent = false;
+        for (size_t s_Pos = s_Body.find("\"Evergreen_"); s_Pos != std::string::npos;
+             s_Pos = s_Body.find("\"Evergreen_", s_Pos + 1))
+        {
+            if (s_Body.compare(s_Pos, sizeof(k_CrossModeEvent) - 1, k_CrossModeEvent) != 0)
+            {
+                s_HasEvergreenEvent = true;
+                break;
+            }
+        }
+
+        if (s_HasEvergreenEvent
+            || s_Body.find("\"EvergreenMission") != std::string::npos
+            || s_Body.find("\"ContractType\":\"evergreen\"") != std::string::npos)
+        {
+            Logger::Info("[NoMoreAltF4] Freelancer mode detected via Evergreen event in HTTP traffic.");
+            s_Plugin->m_FreelancerDetected = true;
+        }
     }
 
     // --- Elusive Target / Arcade detection ---
@@ -707,6 +752,22 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventSent,
 
         if (s_DeathEvent || s_ContractFailed)
         {
+            // Manual player actions (Restart Mission, Replan Mission, load)
+            // also emit ContractFailed, with the reason embedded in the event
+            // itself: "Value":"Contract ended manually: OnRestartLevel" (or
+            // OnReplanLevel / OnLoadGame).  ETs allow restart/replan before
+            // the target is engaged, so these are legitimate in every mode —
+            // let them through.  Both markers observed live on the Herbalist
+            // ET (game 3.280); a real failure never carries them.
+            if (!s_DeathEvent && s_ContractFailed
+                && (s_EventStr.find("OnRestartLevel") != std::string::npos
+                    || s_EventStr.find("OnReplanLevel") != std::string::npos
+                    || s_EventStr.find("OnLoadGame") != std::string::npos))
+            {
+                Logger::Info("[NoMoreAltF4] ContractFailed is a manual restart/replan/load — allowing.");
+                return HookAction::Continue();
+            }
+
             // Honor the exit-to-menu opt-out.
             if (!s_DeathEvent && s_ContractFailed && m_AllowExitToMenu
                 && s_EventStr.find("exit to Main menu") != std::string::npos)
@@ -792,6 +853,41 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, Http_WinHttpCallback,
 // to log response content so you can identify exactly which API endpoints IOI
 // uses for mission/ET outcomes.
 // -----------------------------------------------------------------------------
+
+// Inflate a gzip/zlib-compressed buffer into p_Out for LOG DISPLAY ONLY — the
+// game's own buffer is never modified.  Returns false if the data doesn't
+// decompress cleanly (caller falls back to raw logging).
+static bool TryInflateForLog(const uint8_t* p_Data, size_t p_Size, std::string& p_Out)
+{
+    z_stream s_Strm {};
+    // 15 = max window size; +32 auto-detects gzip or zlib headers.
+    if (inflateInit2(&s_Strm, 15 + 32) != Z_OK)
+        return false;
+
+    s_Strm.next_in = const_cast<Bytef*>(p_Data);
+    s_Strm.avail_in = static_cast<uInt>(p_Size);
+
+    char s_Chunk[16384];
+    int s_Ret = Z_OK;
+
+    while (s_Ret == Z_OK && p_Out.size() < k_MaxLogBytes)
+    {
+        s_Strm.next_out = reinterpret_cast<Bytef*>(s_Chunk);
+        s_Strm.avail_out = sizeof(s_Chunk);
+        s_Ret = inflate(&s_Strm, Z_NO_FLUSH);
+
+        if (s_Ret != Z_OK && s_Ret != Z_STREAM_END)
+            break;
+
+        p_Out.append(s_Chunk, sizeof(s_Chunk) - s_Strm.avail_out);
+    }
+
+    inflateEnd(&s_Strm);
+
+    // Success = full stream inflated, or output hit the log cap mid-stream.
+    return s_Ret == Z_STREAM_END || (s_Ret == Z_OK && p_Out.size() >= k_MaxLogBytes);
+}
+
 DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZHttpResultDynamicObject_OnBufferReady,
     ZHttpResultDynamicObject* th)
 {
@@ -802,11 +898,34 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZHttpResultDynamicObject_OnBufferReady,
 
         if (s_Data && s_Size > 0)
         {
-            // Clip only pathologically large responses (see k_MaxLogBytes).
-            const size_t s_LogSize = s_Size < k_MaxLogBytes ? s_Size : k_MaxLogBytes;
-            std::string s_Body(s_Data, s_Data + s_LogSize);
-            Logger::Info("[NoMoreAltF4] HTTP Response ({} bytes): {}{}", s_Size, s_Body,
-                s_Size > k_MaxLogBytes ? "..." : "");
+            // IOI compresses some endpoints; this hook sees the raw buffer
+            // before the game inflates it (gzip magic 1F 8B), so those bodies
+            // would log as binary garbage.  Decompress a copy for display.
+            bool s_Logged = false;
+
+            if (s_Size >= 2 && static_cast<uint8_t>(s_Data[0]) == 0x1F
+                && static_cast<uint8_t>(s_Data[1]) == 0x8B)
+            {
+                std::string s_Inflated;
+                if (TryInflateForLog(reinterpret_cast<const uint8_t*>(s_Data), s_Size, s_Inflated))
+                {
+                    const bool s_Clipped = s_Inflated.size() > k_MaxLogBytes;
+                    if (s_Clipped)
+                        s_Inflated.resize(k_MaxLogBytes);
+                    Logger::Info("[NoMoreAltF4] HTTP Response (gzip {} -> {} bytes): {}{}",
+                        s_Size, s_Inflated.size(), s_Inflated, s_Clipped ? "..." : "");
+                    s_Logged = true;
+                }
+            }
+
+            if (!s_Logged)
+            {
+                // Clip only pathologically large responses (see k_MaxLogBytes).
+                const size_t s_LogSize = s_Size < k_MaxLogBytes ? s_Size : k_MaxLogBytes;
+                std::string s_Body(s_Data, s_Data + s_LogSize);
+                Logger::Info("[NoMoreAltF4] HTTP Response ({} bytes): {}{}", s_Size, s_Body,
+                    s_Size > k_MaxLogBytes ? "..." : "");
+            }
         }
     }
 
@@ -824,7 +943,7 @@ void NoMoreAltF4::OnDrawMenu()
         // --- Protection settings ---
         if (ImGui::Checkbox("Terminate Game Process on Death/Failure", &m_AutoKillEnabled))
         {
-            SetSettingBool(S_SETTINGS_SECTION, "AutoKillEnabled", m_AutoKillEnabled);
+            SetSettingBool(S_SETTINGS_SECTION, "autokillenabled", m_AutoKillEnabled);
             Logger::Info("[NoMoreAltF4] Terminate on failure: {}", m_AutoKillEnabled ? "ON" : "OFF");
         }
         if (ImGui::IsItemHovered())
@@ -843,7 +962,7 @@ void NoMoreAltF4::OnDrawMenu()
         // --- Scope ---
         if (ImGui::Checkbox("Only Enable for Freelancer", &m_FreelancerOnly))
         {
-            SetSettingBool(S_SETTINGS_SECTION, "FreelancerOnly", m_FreelancerOnly);
+            SetSettingBool(S_SETTINGS_SECTION, "freelanceronly", m_FreelancerOnly);
             Logger::Info("[NoMoreAltF4] Freelancer only: {}", m_FreelancerOnly ? "ON" : "OFF");
         }
         if (ImGui::IsItemHovered())
@@ -853,7 +972,7 @@ void NoMoreAltF4::OnDrawMenu()
 
         if (ImGui::Checkbox("Allow Exit to Main Menu", &m_AllowExitToMenu))
         {
-            SetSettingBool(S_SETTINGS_SECTION, "AllowExitToMenu", m_AllowExitToMenu);
+            SetSettingBool(S_SETTINGS_SECTION, "allowexittomenu", m_AllowExitToMenu);
             Logger::Info("[NoMoreAltF4] Allow exit to menu: {}", m_AllowExitToMenu ? "ON" : "OFF");
         }
         if (ImGui::IsItemHovered())
@@ -880,24 +999,25 @@ void NoMoreAltF4::OnDrawMenu()
         else
             ImGui::Text("Manual abort hotkey: None (disabled)");
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Press this key to instantly abort the mission.\nUse when spotted or about to fail.");
+            ImGui::SetTooltip("Press this key to instantly abort the mission.\nUse when spotted or about to fail.\n"
+                              "Ignored while Alt or Win is held, so other tools'\ncombos (e.g. Alt+F9 recording) can't trigger it.");
 
-        if (ImGui::SmallButton("None")) { m_ManualKillKey = 0;     SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        if (ImGui::SmallButton("None")) { m_ManualKillKey = 0;     SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
-        if (ImGui::SmallButton("F9")) { m_ManualKillKey = VK_F9;  SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        if (ImGui::SmallButton("F9")) { m_ManualKillKey = VK_F9;  SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
-        if (ImGui::SmallButton("F10")) { m_ManualKillKey = VK_F10; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        if (ImGui::SmallButton("F10")) { m_ManualKillKey = VK_F10; SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
-        if (ImGui::SmallButton("F11")) { m_ManualKillKey = VK_F11; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        if (ImGui::SmallButton("F11")) { m_ManualKillKey = VK_F11; SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
-        if (ImGui::SmallButton("F12")) { m_ManualKillKey = VK_F12; SetSettingInt(S_SETTINGS_SECTION, "ManualKillKey", m_ManualKillKey); }
+        if (ImGui::SmallButton("F12")) { m_ManualKillKey = VK_F12; SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
 
         ImGui::Separator();
 
         // --- Debug ---
         if (ImGui::Checkbox("Log HTTP requests", &m_LogHttpRequests))
         {
-            SetSettingBool(S_SETTINGS_SECTION, "LogHttpRequests", m_LogHttpRequests);
+            SetSettingBool(S_SETTINGS_SECTION, "loghttprequests", m_LogHttpRequests);
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Log all outgoing IOI HTTP request URLs and response bodies\n"

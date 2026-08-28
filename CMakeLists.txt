@@ -21,12 +21,14 @@ set_target_properties(NoMoreAltF4 PROPERTIES COMPILE_FLAGS "/utf-8")
 
 # Add SDK and DX headers dependencies.
 find_package(directx-headers CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 target_link_libraries(NoMoreAltF4
     ZHMModSDK
     Microsoft::DirectX-Guids
     Microsoft::DirectX-Headers
     implot
+    ZLIB::ZLIB
 )
 
 install(TARGETS NoMoreAltF4
