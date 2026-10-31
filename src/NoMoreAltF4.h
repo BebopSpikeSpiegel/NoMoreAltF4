@@ -7,6 +7,8 @@
 #include <winhttp.h>
 #include <atomic>
 
+#include "LogMirror.h"
+
 // Forward declarations for network hook types
 class ZAchievementManagerSimple;
 class ZDynamicObject;
@@ -70,6 +72,12 @@ private:
     // in-flight achievement/HTTP sends on other threads are also intercepted.
     bool m_BlockNetworkOnDeath = true;
     bool m_LogHttpRequests = true;        // Diagnostic: log all IOI HTTP traffic
+
+    // --- Session log archive ---
+    // ZHMModLoader.log is truncated on every launch; this mirrors it (scrubbed)
+    // into <log dir>\NoMoreAltF4Logs\ so a session survives the next start.
+    bool m_ArchiveLogs = true;
+    LogMirror m_LogMirror;
     std::atomic<bool> m_NetworkBlocked{ false };
     // Tick (GetTickCount64) at which the network block was first observed active.
     // Drives the safety release valve in OnDrawUI so a block can never persist
@@ -80,6 +88,11 @@ private:
     void InstallSendRequestHook();
     void RemoveSendRequestHook();
     static std::atomic<bool> s_HookPassthrough;  // When true, HookedSendRequest just calls original
+    // Live plugin instance for HookedSendRequest (runs on WinHTTP threads). Never use Plugin()
+    // there: after unload it would *create* a new instance via GetPluginInterface().
+    static std::atomic<NoMoreAltF4*> s_Instance;
+    // Calls currently inside HookedSendRequest; the destructor drains this before returning.
+    static std::atomic<int> s_InFlight;
 
 public:
     // Public so the free-function PatchIAT helper can use the typedef.

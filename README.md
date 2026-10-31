@@ -11,7 +11,7 @@ In Freelancer mode, dying means losing your carried items, campaign progress, an
 - **Auto-terminate on death/failure** — Detects the failure event the instant it is dispatched and kills the game process *before* it is saved to IOI servers. This is the only reliable, crash-safe protection: the failure is recorded by ordinary network requests that cannot be blocked without crashing or hanging the game, so terminating first is the one approach that always works. Protects carried items, safehouse items, campaign progress, and ET/Arcade attempts.
 - **Smart event filtering** — Player-initiated actions (Restart Mission, Replan Mission, loading saves) are recognized by the reason the game embeds in the event and always pass through, even in Elusive Targets — only genuine failures trigger protection. `ContractFailed` is only treated as a real failure in the single-attempt modes this mod targets (Freelancer / Elusive Target / Arcade).
 - **Allow Exit to Main Menu** (toggle, off by default) — Exiting to main menu during Freelancer or ET missions counts as a failure, so it's blocked unless you explicitly enable this option in the mod menu.
-- **Manual abort hotkey** — Force-quit the mission at any time (spotted, lost Silent Assassin, etc.) with a single keypress. Configurable in the mod menu (None, F9, F10, F11, F12; disabled by default). Presses with Alt or Win held are ignored, so recording combos like Alt+F9 (Nvidia overlay) can never trigger it — while Shift/Ctrl (sprint/crouch) still work mid-panic.
+- **Manual abort hotkey** — Force-quit the mission at any time (spotted, lost Silent Assassin, etc.) with a single keypress. Configurable in the mod menu (None, F8, F9, F10, F11, F12; disabled by default). Presses with Alt or Win held are ignored, so recording combos like Alt+F9 (Nvidia overlay) can never trigger it — while Shift/Ctrl (sprint/crouch) still work mid-panic.
 - **Freelancer detection** — Identifies Freelancer mode via scene path ("Evergreen" codename). Optional "Only Enable for Freelancer" toggle disables all protection in non-Freelancer missions.
 - **Elusive Target protection** — Works for ET failures too (wrong kill method, objective failure) — not just player death.
 
@@ -29,7 +29,9 @@ All per-mission state is reset on mission entry/exit so nothing leaks between mi
 
 ## Compatibility
 
-Built against **ZHMModSDK v4.0.2** and **live-tested on game build 3.280.0.0 ("Season of the Herbalist")** — including on a real live Elusive Target, where ET detection, auto-terminate on a real failure, and the manual abort hotkey were all verified in actual play (terminated failures confirmed never reaching IOI's servers). Always run the ZHMModSDK version that matches your installed game version — a mismatch resolves engine functions at stale offsets and can hang or crash the game.
+Built against **ZHMModSDK v4.2.1** for game build **3.290.1.0**. The previous release (v0.0.8, SDK v4.0.2) was **live-tested on game build 3.280.0.0 ("Season of the Herbalist")** — including on a real live Elusive Target, where ET detection, auto-terminate on a real failure, and the manual abort hotkey were all verified in actual play (terminated failures confirmed never reaching IOI's servers). The mod's hooks and detection logic are unchanged by the SDK v4.2 API changes. Always run the ZHMModSDK version that matches your installed game version — a mismatch resolves engine functions at stale offsets and can hang or crash the game.
+
+> **QuickSave mod (SDK v4.2+):** the SDK now bundles a QuickSave mod that uses **F9 to quick-load** (F5 to quick-save). If you enable QuickSave, don't use F9 as the abort hotkey — a quick-load would close the game. Pick F8 or F10–F12 instead.
 
 ## Why This Works
 
@@ -50,8 +52,17 @@ Open the ZHMModSDK overlay menu (`~` key) to access settings:
 | Terminate Game Process on Death/Failure | On | Kill the process the moment a failure is detected — the only reliable protection. **Leave this on.** |
 | Only Enable for Freelancer | Off | Restrict all protection to Freelancer mode only |
 | Allow Exit to Main Menu | Off | Allow exiting to main menu without blocking (risky in Freelancer/ET) |
-| Manual abort hotkey | None | Hotkey to force-quit the mission manually (None, F9–F12) |
+| Manual abort hotkey | None | Hotkey to force-quit the mission manually (None, F8–F12) |
 | Log HTTP requests | On | Log all IOI HTTP traffic for diagnostics |
+| Archive session logs | On | Keep a copy of every session's log (see below) |
+
+## Logs
+
+ZHMModSDK writes its log to `ZHMModLoader.log` in the game folder and **wipes it every time the game starts** — so the log of a session that ended in an auto-terminate or a crash is normally gone by the next launch.
+
+With **Archive session logs** on, NoMoreAltF4 copies each session live into `NoMoreAltF4Logs\session-YYYYMMDD-HHMMSS.log` next to `ZHMModLoader.log` (the last 30 sessions are kept). The copy includes the final lines written right before an auto-terminate. Login tokens are redacted, so these files are **safe to attach to a bug report**. Use **Open log folder** in the mod menu to find them.
+
+For developers: when launching from Visual Studio with an `*-Install` preset, the install step also copies the previous session's raw `ZHMModLoader.log` into the project's `logs\` folder before the game starts (`cmake/archive-game-log.cmake`). These raw copies are unredacted and gitignored.
 
 ## Building
 

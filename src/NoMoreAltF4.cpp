@@ -12,6 +12,7 @@
 #include <Glacier/SOnlineEvent.h>
 
 #include <Windows.h>
+#include <shellapi.h>
 #pragma comment(lib, "winhttp.lib")
 
 #include <zlib.h>
@@ -57,6 +58,29 @@ static constexpr size_t k_MaxLogBytes = 1u << 20;
 // Static storage for the original WinHttpSendRequest pointer (pre-hook).
 NoMoreAltF4::FnWinHttpSendRequest NoMoreAltF4::s_OriginalSendRequest = nullptr;
 std::atomic<bool> NoMoreAltF4::s_HookPassthrough{ false };
+std::atomic<NoMoreAltF4*> NoMoreAltF4::s_Instance{ nullptr };
+std::atomic<int> NoMoreAltF4::s_InFlight{ 0 };
+
+// Pin this DLL so it is never unmapped while the game runs.
+//
+// Workaround for ZHMModSDK <= 4.2.1 (OrfeasZ/ZHMModSDK#280): every mod links imgui
+// statically, and the patched imgui's stack-layout code registers context hooks
+// (NewFramePre / EndFramePre / Shutdown) into the SDK's *shared* ImGui context with
+// callbacks pointing into this DLL the first time our menu draws anything. The SDK
+// never removes them, so when the mod is disabled at runtime and FreeLibrary'd, the
+// next ImGui::EndFrame() calls StackLayout_EndFramePreCallback in unmapped memory.
+// Pinned, the SDK still deletes the plugin object (all our logic stops), but the code
+// those stale callbacks point at stays valid. It also makes any WinHTTP call that is
+// mid-flight inside HookedSendRequest during unload safe. Cost: the DLL file stays
+// locked until the game exits (no hot-swapping a rebuilt DLL in the same session).
+static void PinThisModule()
+{
+    HMODULE s_Module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&PinThisModule), &s_Module))
+        Logger::Warn("[NoMoreAltF4] Could not pin module (error {}); disabling the mod at runtime may crash the game.",
+                     GetLastError());
+}
 
 // =============================================================================
 // Initialization
@@ -64,6 +88,8 @@ std::atomic<bool> NoMoreAltF4::s_HookPassthrough{ false };
 
 void NoMoreAltF4::Init()
 {
+    PinThisModule();
+
     // Load persisted settings from the plugin's INI file.
     // Settings API: GetSettingBool(section, name, defaultValue)
     m_AutoKillEnabled      = GetSettingBool(S_SETTINGS_SECTION, "autokillenabled",      true);
@@ -72,6 +98,11 @@ void NoMoreAltF4::Init()
     m_BlockNetworkOnDeath  = GetSettingBool(S_SETTINGS_SECTION, "blocknetworkondeath",  true);
     m_LogHttpRequests      = GetSettingBool(S_SETTINGS_SECTION, "loghttprequests",      true);
     m_AllowExitToMenu      = GetSettingBool(S_SETTINGS_SECTION, "allowexittomenu",      false);
+    m_ArchiveLogs          = GetSettingBool(S_SETTINGS_SECTION, "archivesessionlogs",   true);
+
+    // Start mirroring ZHMModLoader.log into NoMoreAltF4Logs\ as early as
+    // possible (the SDK truncates the live log on every launch).
+    m_LogMirror.Start(m_ArchiveLogs);
 
     Logger::Info("[NoMoreAltF4] Plugin loaded. Auto-kill: {}, Freelancer-only: {}, Hotkey: 0x{:X}, BlockNet: {}, LogHTTP: {}",
         m_AutoKillEnabled, m_FreelancerOnly, m_ManualKillKey, m_BlockNetworkOnDeath, m_LogHttpRequests);
@@ -91,6 +122,7 @@ void NoMoreAltF4::OnEngineInitialized()
     Hooks::ZHttpResultDynamicObject_OnBufferReady->AddDetour(this, &NoMoreAltF4::ZHttpResultDynamicObject_OnBufferReady);
 
     // Install manual IAT hook for WinHttpSendRequest so we can read POST bodies.
+    s_Instance = this;
     InstallSendRequestHook();
 }
 
@@ -99,7 +131,23 @@ NoMoreAltF4::~NoMoreAltF4()
     // Make IAT hook a passthrough, then swap IAT to persistent JMP stub
     // so in-flight WinHttpSendRequest calls don't land in freed DLL memory.
     s_HookPassthrough = true;
+    s_Instance = nullptr;
     RemoveSendRequestHook();
+
+    // Drain WinHTTP calls already inside HookedSendRequest (they may have loaded
+    // s_Instance before it was cleared) so none touches this object after it's freed.
+    // Bounded: never hang the game's render thread on a stuck network call.
+    const ULONGLONG s_DrainStart = GetTickCount64();
+    while (s_InFlight.load() > 0 && GetTickCount64() - s_DrainStart < 2000)
+        Sleep(1);
+
+    // Final archive append + bounded worker shutdown.
+    m_LogMirror.Stop();
+
+    // The DLL is pinned (see PinThisModule), so its statics survive a disable/enable
+    // cycle. Reset the singleton DEFINE_ZHM_PLUGIN keeps, or re-enabling the mod would
+    // hand the SDK this deleted object.
+    g_NoMoreAltF4_Instance = nullptr;
 
     // SDK detour cleanup is left to the framework (sample mods don't
     // call RemoveDetoursWithContext — the SDK handles it on plugin unload).
@@ -310,6 +358,11 @@ void NoMoreAltF4::KillProcess()
     for (size_t i = 0; i < s_Loggers.Count; ++i)
         s_Loggers.Loggers[i]->flush();
 
+    // Append the just-flushed tail (detection + TERMINATED lines) to the
+    // session archive. Bounded and lock-timeout'd: only the few KB written
+    // since the mirror's last 500 ms poll, so it doesn't delay the kill.
+    m_LogMirror.SyncTail();
+
     // TerminateProcess is used instead of ExitProcess because:
     // - ExitProcess runs DLL detach routines and atexit handlers, which could
     //   trigger save/cleanup code that writes the death state to IOI servers
@@ -458,11 +511,10 @@ void NoMoreAltF4::RemoveSendRequestHook()
     // in-flight calls), patch the IAT to point at the persistent JMP stub.
     // The stub lives in VirtualAlloc'd memory that survives DLL unload and
     // simply jumps to the real WinHttpSendRequest.
+    // s_OriginalSendRequest is deliberately NOT cleared: a call already inside
+    // HookedSendRequest still forwards through it after this returns.
     if (s_PersistentStub && s_OriginalSendRequest)
-    {
         PatchIAT(reinterpret_cast<FnWinHttpSendRequest>(s_PersistentStub));
-        s_OriginalSendRequest = nullptr;
-    }
 }
 
 // The replacement function: inspect, log, and optionally block POST requests.
@@ -484,13 +536,21 @@ BOOL WINAPI NoMoreAltF4::HookedSendRequest(
     LPVOID lpOptional, DWORD dwOptionalLength,
     DWORD dwTotalLength, DWORD_PTR dwContext)
 {
+    // Counted before touching any plugin state so the destructor can drain us.
+    struct InFlightGuard
+    {
+        InFlightGuard() { ++s_InFlight; }
+        ~InFlightGuard() { --s_InFlight; }
+    } s_InFlightGuard;
+
     // During shutdown, skip all logic and call the original directly.
     // This prevents accessing freed plugin memory while in-flight calls drain.
     if (s_HookPassthrough)
         return s_OriginalSendRequest(hRequest, pwszHeaders, dwHeadersLength,
             lpOptional, dwOptionalLength, dwTotalLength, dwContext);
 
-    auto* s_Plugin = Plugin();
+    // Not Plugin(): after unload that would construct a brand-new instance on this thread.
+    auto* s_Plugin = s_Instance.load();
 
     // Build body string once for both logging and blocking checks.
     std::string s_Body;
@@ -893,8 +953,11 @@ DEFINE_PLUGIN_DETOUR(NoMoreAltF4, void, ZHttpResultDynamicObject_OnBufferReady,
 {
     if (m_LogHttpRequests && th)
     {
-        const auto* s_Data = static_cast<const char*>(th->m_buffer.data());
-        const auto  s_Size = th->m_buffer.size();
+        // SDK v4.2 renamed ZBuffer::data()/size() to Get()/Size().  Access by
+        // reference only — never copy a ZBuffer: since v4.2 its destructor
+        // really frees the game's buffer when the refcount drops.
+        const auto* s_Data = static_cast<const char*>(th->m_buffer.Get());
+        const auto  s_Size = th->m_buffer.Size();
 
         if (s_Data && s_Size > 0)
         {
@@ -988,6 +1051,7 @@ void NoMoreAltF4::OnDrawMenu()
         switch (m_ManualKillKey)
         {
         case 0:      keyName = "None"; break;
+        case VK_F8:  keyName = "F8"; break;
         case VK_F9:  keyName = "F9"; break;
         case VK_F10: keyName = "F10"; break;
         case VK_F11: keyName = "F11"; break;
@@ -1004,6 +1068,8 @@ void NoMoreAltF4::OnDrawMenu()
 
         if (ImGui::SmallButton("None")) { m_ManualKillKey = 0;     SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
+        if (ImGui::SmallButton("F8")) { m_ManualKillKey = VK_F8;  SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
+        ImGui::SameLine();
         if (ImGui::SmallButton("F9")) { m_ManualKillKey = VK_F9;  SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
         if (ImGui::SmallButton("F10")) { m_ManualKillKey = VK_F10; SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
@@ -1011,6 +1077,13 @@ void NoMoreAltF4::OnDrawMenu()
         if (ImGui::SmallButton("F11")) { m_ManualKillKey = VK_F11; SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
         ImGui::SameLine();
         if (ImGui::SmallButton("F12")) { m_ManualKillKey = VK_F12; SetSettingInt(S_SETTINGS_SECTION, "manualkillkey", m_ManualKillKey); }
+
+        // SDK v4.2+ bundles a QuickSave mod that binds F9 to quick-load (F5 to
+        // quick-save). With both on F9, a quick-load would close the game.
+        if (m_ManualKillKey == VK_F9)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                "Note: F9 is also the SDK QuickSave mod's quick-load key.\n"
+                "If you use QuickSave, pick a different abort key.");
 
         ImGui::Separator();
 
@@ -1023,6 +1096,28 @@ void NoMoreAltF4::OnDrawMenu()
             ImGui::SetTooltip("Log all outgoing IOI HTTP request URLs and response bodies\n"
                               "to the ZHMModSDK log. Use this to identify which endpoints\n"
                               "handle Elusive Target / mission results.");
+
+        if (ImGui::Checkbox("Archive session logs", &m_ArchiveLogs))
+        {
+            SetSettingBool(S_SETTINGS_SECTION, "archivesessionlogs", m_ArchiveLogs);
+            m_LogMirror.SetEnabled(m_ArchiveLogs);
+            Logger::Info("[NoMoreAltF4] Archive session logs: {}", m_ArchiveLogs ? "ON" : "OFF");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ZHMModLoader.log is wiped every time the game starts. When enabled,\n"
+                              "each session is copied live into NoMoreAltF4Logs\\ (last 30 kept),\n"
+                              "including the final lines before an auto-terminate or crash.\n"
+                              "Login tokens are redacted, so these files are safe to share.");
+
+        const auto s_ArchiveFolder = m_LogMirror.Folder();
+        if (!s_ArchiveFolder.empty())
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(ICON_MD_FOLDER_OPEN " Open log folder"))
+                ShellExecuteW(nullptr, L"open", s_ArchiveFolder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Current session: %ls", m_LogMirror.SessionFile().filename().c_str());
+        }
 
         ImGui::Separator();
 
