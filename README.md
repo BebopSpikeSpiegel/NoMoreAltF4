@@ -29,7 +29,7 @@ All per-mission state is reset on mission entry/exit so nothing leaks between mi
 
 ## Compatibility
 
-Built against **ZHMModSDK v4.2.1** for game build **3.290.1.0**. The previous release (v0.0.8, SDK v4.0.2) was **live-tested on game build 3.280.0.0 ("Season of the Herbalist")** — including on a real live Elusive Target, where ET detection, auto-terminate on a real failure, and the manual abort hotkey were all verified in actual play (terminated failures confirmed never reaching IOI's servers). The mod's hooks and detection logic are unchanged by the SDK v4.2 API changes. Always run the ZHMModSDK version that matches your installed game version — a mismatch resolves engine functions at stale offsets and can hang or crash the game.
+Built against **ZHMModSDK v4.2.1** and **tested on game build 3.290.1.0**. The previous release (v0.0.8, SDK v4.0.2) was **live-tested on game build 3.280.0.0 ("Season of the Herbalist")** — including on a real live Elusive Target, where ET detection, auto-terminate on a real failure, and the manual abort hotkey were all verified in actual play (terminated failures confirmed never reaching IOI's servers). The mod's hooks and detection logic are unchanged by the SDK v4.2 API changes. Always run the ZHMModSDK version that matches your installed game version — a mismatch resolves engine functions at stale offsets and can hang or crash the game.
 
 > **QuickSave mod (SDK v4.2+):** the SDK now bundles a QuickSave mod that uses **F9 to quick-load** (F5 to quick-save). If you enable QuickSave, don't use F9 as the abort hotkey — a quick-load would close the game. Pick F8 or F10–F12 instead.
 
