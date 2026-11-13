@@ -6,6 +6,8 @@
 #include <Windows.h>
 #include <winhttp.h>
 #include <atomic>
+#include <functional>
+#include <string>
 
 #include "LogMirror.h"
 
@@ -13,16 +15,18 @@
 class ZAchievementManagerSimple;
 class ZDynamicObject;
 class ZHttpResultDynamicObject;
+class ZString;
+class ZAsyncContext;
+struct SHttpRequestBehavior;
 
 // =============================================================================
-// NoMoreAltF4 - Automatic death prevention for Hitman WoA Freelancer mode
+// NoMoreAltF4 - failure protection for HITMAN World of Assassination
 //
-// ZHMModSDK plugin that monitors player alive state during Freelancer missions
-// and terminates the game process on death before the failure is saved.
-// Also provides a manual hotkey for aborting missions without penalty.
-//
-// BUILD: This plugin builds within a CMake project that fetches ZHMModSDK
-// via FetchContent. Place Src/ files in your project's Src/ directory.
+// ZHMModSDK plugin. When a Freelancer, Elusive Target or Arcade attempt fails,
+// it either terminates the game before the failure is saved (the default), or,
+// with Seamless on, rewrites the failed attempt's outgoing events so the server
+// never learns of the failure and the game keeps running. It also provides a
+// manual abort key and can re-enable saving in no-save story missions.
 // =============================================================================
 
 class NoMoreAltF4 : public IPluginInterface
@@ -66,6 +70,11 @@ private:
     // --- Hotkey ---
     int m_ManualKillKey = 0;              // Default: None (0 = disabled)
     bool m_ManualKillKeyPrevState = false; // Edge detection
+    bool m_AbortQueued = false;            // abort key pressed while a session was starting (render thread)
+    uint64_t m_AbortIgnoredUntilMs = 0;    // show "abort key ignored" until this tick (render thread)
+
+    // --- Saving in no-save story missions and escalations ---
+    std::atomic<bool> m_EnableSavingStory{ false };
 
     // --- Network blocking ---
     // Set to true in KillProcess() before TerminateProcess() so that any
@@ -83,6 +92,32 @@ private:
     // Drives the safety release valve in OnDrawUI so a block can never persist
     // indefinitely and freeze the game. 0 = not currently timing a block.
     std::atomic<uint64_t> m_NetworkBlockedAtMs{ 0 };
+
+    // --- Seamless protection (experimental) ---
+    // Instead of terminating, a failed attempt is quarantined and its events are
+    // rewritten in outgoing bodies (see EventBodyRewriter.h). Opt-in per
+    // contract type. Freelancer is experimental and fails closed (see OnEventSent).
+    enum class SeamlessMode { Off, Test, Staked };
+    std::atomic<bool> m_Seamless{ false };           // story/other contracts, Arcade and Elusive Targets
+    std::atomic<bool> m_SeamlessFreelancer{ false }; // experimental: see the guard in OnEventSent
+    std::atomic<bool> m_SeamlessAlarm{ false };          // the server closed a contained attempt unexpectedly
+    std::atomic<bool> m_SeamlessPersistPending{ false }; // settings changed off the render thread
+    std::atomic<uint64_t> m_SeamlessNoticeUntilMs{ 0 };
+    std::atomic<bool> m_SeamlessNoticeExit{ false };     // the last contained event was a pause-menu exit
+    std::atomic<bool> m_SeamlessNoticeFreelancer{ false }; // the last contained attempt was a Freelancer mission
+
+    bool AnySeamlessEnabled() const;
+    SeamlessMode SeamlessFor(const char* p_Csid, size_t p_Len) const;
+    void OnSeamlessArmed(const char* p_Csid, size_t p_Len, bool p_ExitToMenu);
+    void LoadPastQuarantine();
+    void CheckServerCloses(const char* p_Text, size_t p_Len);
+    void DrawSeamlessNotice();
+
+    // Runs first in HookedSendRequest, on static state only (so it keeps working
+    // while the plugin is disabled). Returns the body pointer to send.
+    static LPVOID SeamlessFilter(HINTERNET hRequest, LPCWSTR pwszHeaders, DWORD dwHeadersLength,
+                                 LPVOID lpOptional, DWORD dwOptionalLength, DWORD dwTotalLength);
+    static void SeamlessFallback(const char* p_Reason);
 
     // --- WinHttpSendRequest manual hook ---
     void InstallSendRequestHook();
@@ -135,6 +170,13 @@ private:
     //   call is made, which is earlier than WinHTTP-level interception.
     DECLARE_PLUGIN_DETOUR(NoMoreAltF4, void, ZAchievementManagerSimple_OnEventSent,
         ZAchievementManagerSimple* th, uint32_t eventIndex, const ZDynamicObject& event);
+
+    // ZUserChannelContractsProxyBase_GetForPlay2: the request that loads a contract.
+    //   Its reply carries Contract.Data.EnableSaving; see PatchEnableSaving.
+    DECLARE_PLUGIN_DETOUR(NoMoreAltF4, void, ZUserChannelContractsProxyBase_GetForPlay2,
+        const ZString& id, const ZString& locationId, const ZDynamicObject& extraGameChangedIds, int difficulty,
+        const std::function<void(const ZDynamicObject&)>& onOk, const std::function<void(int)>& onError,
+        ZAsyncContext* ctx, const SHttpRequestBehavior& behavior);
 };
 
 // Declare DLL exports + Plugin() accessor

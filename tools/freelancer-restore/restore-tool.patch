@@ -1,0 +1,637 @@
+diff --git a/src/NoMoreAltF4.h b/src/NoMoreAltF4.h
+--- a/src/NoMoreAltF4.h
++++ b/src/NoMoreAltF4.h
+@@ -111,6 +111,17 @@
+                                  LPVOID lpOptional, DWORD dwOptionalLength, DWORD dwTotalLength);
+     static void SeamlessFallback(const char* p_Reason);
+ 
++    // --- Freelancer campaign restore (one shot) ---
++    // freelancer-restore.json in the session log folder holds a saved copy of the
++    // campaign data (line 1: CpdId contract id, line 2: summary, line 3: the
++    // values as one JSON object). When armed, the next campaign-data upload from
++    // the safehouse (a CpdSet event) carries those values instead of its own, and
++    // the game is closed once the server answers 200, so that the game's stale
++    // copy cannot overwrite them.
++    void LoadRestoreFile();
++    void DrawRestoreMenu();
++    static bool RestoreFilter(HINTERNET hRequest, LPVOID& lpOptional, DWORD& dwOptionalLength, DWORD& dwTotalLength);
++
+     // --- WinHttpSendRequest manual hook ---
+     void InstallSendRequestHook();
+     void RemoveSendRequestHook();
+diff --git a/src/NoMoreAltF4.cpp b/src/NoMoreAltF4.cpp
+--- a/src/NoMoreAltF4.cpp
++++ b/src/NoMoreAltF4.cpp
+@@ -42,6 +42,8 @@
+ // on the next launch (every session would start with defaults).
+ static const ZString S_SETTINGS_SECTION = "nomorealtf4";
+ 
++static void DrawRestoreNotice();     // Freelancer campaign restore overlay (defined below)
++static bool RestoreAnswerOverdue();  // restore sent and unanswered for too long (defined below)
+ 
+ // Safety release valve: the maximum time a network block may stay active without
+ // the process having terminated.  This bounds the "drop outgoing online events"
+@@ -123,6 +125,9 @@
+     // and CheckServerCloses reports how.
+     LoadPastQuarantine();
+ 
++    // A saved Freelancer campaign, if one was put in the log folder.
++    LoadRestoreFile();
++
+     Logger::Info("[NoMoreAltF4] Plugin loaded. Auto-kill: {}, Freelancer-only: {}, Hotkey: 0x{:X}, BlockNet: {}, LogHTTP: {}",
+         m_AutoKillEnabled, m_FreelancerOnly, m_ManualKillKey, m_BlockNetworkOnDeath, m_LogHttpRequests);
+ }
+@@ -191,6 +196,15 @@
+         return;
+ 
+     DrawSeamlessNotice();
++    DrawRestoreNotice();
++
++    // Restore watchdog: the saved campaign has left and no answer came. Close
++    // the game anyway, so its own campaign cannot overwrite the restored one.
++    if (RestoreAnswerOverdue())
++    {
++        KillProcess();
++        return;
++    }
+ 
+     // --- Manual hotkey check (edge-triggered: fires once on key down) ---
+     if (m_ManualKillKey != 0)
+@@ -619,10 +633,84 @@
+     }
+ }
+ 
++// =============================================================================
++// Freelancer campaign restore (one shot)
++// =============================================================================
++// The Freelancer campaign (carried items, merces, campaign step, safehouse) is
++// one key/value store on IOI's server, written only by the game's own CpdSet
++// events and served back in every Freelancer GetForPlay2 response as
++// ContractProgressionData. A saved copy of that store can therefore be put back
++// by one CpdSet that carries all of its values. The restore rides on a CpdSet
++// the game itself sends from the safehouse (same event, same Id, same session):
++// only its Value object is replaced. The request is really sent; once the
++// server answers 200 the game is closed, because its in-memory campaign is the
++// pre-restore one and would overwrite the restored values with its next upload.
++enum : int { k_RestoreIdle = 0, k_RestoreArmed, k_RestoreSent, k_RestoreAccepted, k_RestoreFailed };
++static std::atomic<int> s_RestoreState{ k_RestoreIdle };
++static std::atomic<HINTERNET> s_RestoreRequest{ nullptr };
++static std::atomic<uint32_t> s_RestoreHttpStatus{ 0 };
++static std::atomic<uint64_t> s_RestoreSentAtMs{ 0 };
++
++// Written on the render thread under the exclusive lock (only while not armed
++// or sent); RestoreFilter reads them under the shared lock.
++static SRWLOCK s_RestoreLock = SRWLOCK_INIT;
++static std::string s_RestoreContractId;  // CpdId: the Freelancer safehouse contract id
++static std::string s_RestoreValues;      // one JSON object
++static std::string s_RestoreSummary;     // human-readable line from the file
++static std::string s_RestoreLoadError;   // why the file is not usable ("" = loaded)
++
++static constexpr const char* k_RestoreFileName = "freelancer-restore.json";
++static constexpr size_t k_RestoreMaxBytes = 4u << 20;
++static constexpr uint64_t k_RestoreAnswerTimeoutMs = 10000;  // then the game is closed anyway
++
++// The only carrier the restore uses: a 1-key upload with a plain number, such
++// as {"GearWall_ThematicIndex":2.000000} or {"MyValue01":1.000000}, which the
++// game sends when the player pages through a safehouse display. Never a
++// departure or quit upload, which carries many keys.
++static bool IsSingleNumberCarrier(std::string_view p_Value)
++{
++    // {"<key>":<number>}
++    if (p_Value.size() < 6 || p_Value.front() != '{' || p_Value.back() != '}' || p_Value[1] != '"')
++        return false;
++    const size_t s_KeyEnd = p_Value.find('"', 2);
++    if (s_KeyEnd == std::string_view::npos || s_KeyEnd + 2 >= p_Value.size() - 1 || p_Value[s_KeyEnd + 1] != ':')
++        return false;
++    for (size_t i = 2; i < s_KeyEnd; ++i)
++    {
++        const char c = p_Value[i];
++        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
++            return false;
++    }
++    bool s_Digit = false;
++    for (size_t i = s_KeyEnd + 2; i < p_Value.size() - 1; ++i)
++    {
++        const char c = p_Value[i];
++        if (c >= '0' && c <= '9')
++            s_Digit = true;
++        else if (c != '.' && c != '-')
++            return false;
++    }
++    return s_Digit;
++}
++
+ // Session id of the Freelancer safehouse visit in progress (ContractStart with
+ // LocationId LOCATION_SNUG). Static, like the ebr kind table, so a disable /
+ // re-enable of the plugin keeps it. Game thread (OnEventSent) only.
+ static std::string s_SafehouseCsid;
++
++static bool IsGuidText(std::string_view p_Text)
++{
++    if (p_Text.size() != 36)
++        return false;
++    for (size_t i = 0; i < p_Text.size(); ++i)
++    {
++        const char c = p_Text[i];
++        const bool s_Dash = (i == 8 || i == 13 || i == 18 || i == 23);
++        if (s_Dash ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
++            return false;
++    }
++    return true;
++}
+ 
+ // Appends the NAME of every header in a CRLF-separated block. Values are never
+ // read into the result: they include the Authorization token.
+@@ -829,6 +917,302 @@
+                  s_Report.ladder);
+ 
+     return s_Copy;
++}
++
++// Replaces the Value of the safehouse's next CpdSet with the saved campaign.
++// Static state only. Returns true when the body (and its length) was replaced.
++bool NoMoreAltF4::RestoreFilter(HINTERNET hRequest, LPVOID& lpOptional, DWORD& dwOptionalLength, DWORD& dwTotalLength)
++{
++    if (s_RestoreState.load(std::memory_order_acquire) != k_RestoreArmed)
++        return false;
++    // Only with a live plugin: its WinHTTP callback detour is what closes the
++    // game after the answer.
++    if (s_HookPassthrough.load() || !s_Instance.load())
++        return false;
++    if (!hRequest || !lpOptional || dwOptionalLength == 0 || dwOptionalLength != dwTotalLength
++        || dwOptionalLength > k_RestoreMaxBytes)
++        return false;
++
++    // The game's buffer is read once, into a private copy.
++    std::string s_Body(dwOptionalLength, '\0');
++    if (!GuardedCopy(s_Body.data(), lpOptional, dwOptionalLength))
++        return false;
++    if (!ebr::LooksLikeEventsBody(s_Body.data(), s_Body.size()))
++        return false;
++
++    std::string s_New;
++    std::string s_Cid;
++    size_t s_Begin = 0;
++    size_t s_End = 0;
++    uint32_t s_Events = 0;
++    uint32_t s_Matches = 0;
++    size_t s_ValuesLen = 0;
++
++    AcquireSRWLockShared(&s_RestoreLock);
++    s_Cid = s_RestoreContractId;
++    if (!s_RestoreValues.empty()
++        && ebr::FindCpdSetValue(s_Body.data(), s_Body.size(), s_Cid.data(), s_Cid.size(),
++                                &s_Begin, &s_End, &s_Events, &s_Matches)
++        // Exactly one safehouse CpdSet in the body, and it is a 1-key numeric
++        // upload (paging a safehouse display): anything else keeps waiting, so a
++        // forgotten arm cannot ride on a departure or quit upload.
++        && s_Matches == 1
++        && IsSingleNumberCarrier(std::string_view(s_Body).substr(s_Begin, s_End - s_Begin)))
++    {
++        s_ValuesLen = s_RestoreValues.size();
++        s_New.reserve(s_Body.size() - (s_End - s_Begin) + s_ValuesLen);
++        s_New.append(s_Body, 0, s_Begin);
++        s_New.append(s_RestoreValues);
++        s_New.append(s_Body, s_End, std::string::npos);
++    }
++    ReleaseSRWLockShared(&s_RestoreLock);
++
++    if (s_New.empty())
++        return false;  // not a safehouse CpdSet: keep waiting
++
++    // The result must parse as the same events body with the saved values in place.
++    size_t s_CheckBegin = 0;
++    size_t s_CheckEnd = 0;
++    uint32_t s_CheckEvents = 0;
++    if (s_New.size() > k_RestoreMaxBytes
++        || !ebr::FindCpdSetValue(s_New.data(), s_New.size(), s_Cid.data(), s_Cid.size(),
++                                 &s_CheckBegin, &s_CheckEnd, &s_CheckEvents)
++        || s_CheckEvents != s_Events || s_CheckBegin != s_Begin || s_CheckEnd - s_CheckBegin != s_ValuesLen)
++    {
++        int s_Armed = k_RestoreArmed;
++        if (s_RestoreState.compare_exchange_strong(s_Armed, k_RestoreFailed))
++            Logger::Error("[NoMoreAltF4] RESTORE FAILED: the rebuilt body did not check out; nothing was sent.");
++        return false;
++    }
++
++    // WinHTTP reads the body asynchronously (and again on a redirect), so the
++    // buffer is never freed. One restore is about 25 KB.
++    char* s_Buf = static_cast<char*>(HeapAlloc(GetProcessHeap(), 0, s_New.size()));
++    if (!s_Buf)
++    {
++        int s_Armed = k_RestoreArmed;
++        if (s_RestoreState.compare_exchange_strong(s_Armed, k_RestoreFailed))
++            Logger::Error("[NoMoreAltF4] RESTORE FAILED: out of memory; nothing was sent.");
++        return false;
++    }
++    memcpy(s_Buf, s_New.data(), s_New.size());
++
++    // Only the winner of Armed -> Sent records its handle. No callback for this
++    // request can run before the original WinHttpSendRequest is called.
++    int s_Expected = k_RestoreArmed;
++    if (!s_RestoreState.compare_exchange_strong(s_Expected, k_RestoreSent))
++    {
++        // Disarmed from the menu, or another request won, meanwhile.
++        HeapFree(GetProcessHeap(), 0, s_Buf);
++        return false;
++    }
++    s_RestoreRequest.store(hRequest);
++    s_RestoreSentAtMs.store(GetTickCount64());
++
++    Logger::Warn("[NoMoreAltF4] RESTORE SENT: the safehouse campaign upload now carries the saved campaign "
++                 "(body {} -> {} bytes, {} event(s)). Waiting for the server's answer.",
++                 dwOptionalLength, s_New.size(), s_Events);
++
++    lpOptional = s_Buf;
++    dwOptionalLength = static_cast<DWORD>(s_New.size());
++    dwTotalLength = dwOptionalLength;
++    return true;
++}
++
++void NoMoreAltF4::LoadRestoreFile()
++{
++    const auto s_Folder = m_LogMirror.Folder();
++    std::string s_Error;
++    std::string s_ContractId;
++    std::string s_Summary;
++    std::string s_Values;
++
++    if (s_Folder.empty())
++    {
++        s_Error = "the session log folder is unknown";
++    }
++    else
++    {
++        std::ifstream s_In(s_Folder / k_RestoreFileName, std::ios::binary);
++        if (!s_In)
++        {
++            s_Error = "no file";
++        }
++        else
++        {
++            std::string s_All((std::istreambuf_iterator<char>(s_In)), std::istreambuf_iterator<char>());
++            auto s_Line = [&s_All](size_t& p_Pos) {
++                const size_t s_Nl = s_All.find('\n', p_Pos);
++                std::string s_Out = s_All.substr(p_Pos, s_Nl == std::string::npos ? std::string::npos : s_Nl - p_Pos);
++                p_Pos = (s_Nl == std::string::npos) ? s_All.size() : s_Nl + 1;
++                while (!s_Out.empty() && (s_Out.back() == '\r' || s_Out.back() == ' '))
++                    s_Out.pop_back();
++                return s_Out;
++            };
++
++            size_t s_Pos = 0;
++            s_ContractId = s_Line(s_Pos);
++            s_Summary = s_Line(s_Pos);
++            s_Values = s_Line(s_Pos);
++
++            // A test body with the values in place must parse like a real one.
++            const std::string s_Probe = "{\"userId\":\"probe\",\"values\":[{\"Name\":\"CpdSet\",\"ContractId\":\""
++                + s_ContractId + "\",\"Value\":" + s_Values + "}]}";
++            size_t s_B = 0;
++            size_t s_E = 0;
++            uint32_t s_N = 0;
++
++            if (s_All.size() > k_RestoreMaxBytes)
++                s_Error = "the file is too large";
++            else if (!IsGuidText(s_ContractId))
++                s_Error = "line 1 is not a contract id";
++            else if (s_Summary.size() > 300)
++                s_Error = "line 2 (summary) is too long";
++            else if (s_Values.size() < 2 || s_Values.front() != '{' || s_Values.back() != '}')
++                s_Error = "line 3 is not a JSON object";
++            else if (!ebr::FindCpdSetValue(s_Probe.data(), s_Probe.size(), s_ContractId.data(), s_ContractId.size(),
++                                           &s_B, &s_E, &s_N)
++                     || s_N != 1 || s_E - s_B != s_Values.size())
++                s_Error = "line 3 does not parse as JSON";
++        }
++    }
++
++    AcquireSRWLockExclusive(&s_RestoreLock);
++    if (s_Error.empty())
++    {
++        s_RestoreContractId = s_ContractId;
++        s_RestoreSummary = s_Summary;
++        s_RestoreValues = s_Values;
++    }
++    else
++    {
++        s_RestoreContractId.clear();
++        s_RestoreSummary.clear();
++        s_RestoreValues.clear();
++    }
++    s_RestoreLoadError = s_Error;
++    ReleaseSRWLockExclusive(&s_RestoreLock);
++
++    if (s_Error.empty())
++        Logger::Info("[NoMoreAltF4] Freelancer restore file loaded: {} ({} bytes).", s_Summary, s_Values.size());
++    else if (s_Error != "no file")
++        Logger::Warn("[NoMoreAltF4] Freelancer restore file not usable: {}.", s_Error);
++}
++
++void NoMoreAltF4::DrawRestoreMenu()
++{
++    ImGui::TextUnformatted("Freelancer: restore a saved campaign");
++    if (ImGui::IsItemHovered())
++        ImGui::SetTooltip("Puts back a saved copy of your Freelancer campaign (carried items, merces,\n"
++                          "campaign progress) from %s in the session log folder.\n"
++                          "When armed, the next small campaign upload from the safehouse (paging a\n"
++                          "display such as the gear wall) carries the saved\n"
++                          "campaign instead of its own, and the game closes once the server accepts it.\n"
++                          "Launch again and enter the safehouse to see the result.\n"
++                          "This writes to your online profile and cannot be undone by the mod.",
++                          k_RestoreFileName);
++
++    const int s_State = s_RestoreState.load();
++    const bool s_Busy = (s_State == k_RestoreArmed || s_State == k_RestoreSent);
++
++    if (s_RestoreLoadError.empty())
++        ImGui::Text("Saved campaign: %s", s_RestoreSummary.c_str());
++    else
++        ImGui::TextDisabled("No saved campaign (%s).", s_RestoreLoadError.c_str());
++
++    if (!s_Busy && ImGui::Button("Reload file##restore"))
++        LoadRestoreFile();
++
++    switch (s_State)
++    {
++    case k_RestoreIdle:
++    case k_RestoreFailed:
++        if (s_State == k_RestoreFailed)
++            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "Last restore failed (HTTP %u). See the session log.",
++                               s_RestoreHttpStatus.load());
++        if (s_RestoreLoadError.empty())
++        {
++            ImGui::SameLine();
++            if (ImGui::Button("Arm restore##restore"))
++            {
++                s_RestoreHttpStatus = 0;
++                s_RestoreRequest = nullptr;
++                s_RestoreSentAtMs = 0;  // the watchdog must never see an earlier attempt's time
++                s_RestoreState.store(k_RestoreArmed, std::memory_order_release);
++                Logger::Warn("[NoMoreAltF4] RESTORE ARMED: {}. Waiting for a campaign upload from the safehouse.",
++                             s_RestoreSummary);
++            }
++        }
++        break;
++    case k_RestoreArmed:
++        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
++            "Armed. In the safehouse, open the gear wall and switch to another page once.");
++        ImGui::SameLine();
++        if (ImGui::Button("Disarm##restore"))
++        {
++            int s_Expected = k_RestoreArmed;
++            if (s_RestoreState.compare_exchange_strong(s_Expected, k_RestoreIdle))
++                Logger::Info("[NoMoreAltF4] RESTORE disarmed.");
++        }
++        break;
++    case k_RestoreSent:
++        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Sent. The game closes when the server answers (at most 10 s).");
++        ImGui::SameLine();
++        if (ImGui::Button("Close game now##restore"))
++        {
++            Logger::Warn("[NoMoreAltF4] RESTORE: game closed from the menu while waiting for the answer.");
++            KillProcess();
++        }
++        break;
++    case k_RestoreAccepted:
++        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "Sent and answered. The game is closing.");
++        break;
++    default:
++        break;
++    }
++}
++
++static bool RestoreAnswerOverdue()
++{
++    if (s_RestoreState.load() != k_RestoreSent)
++        return false;
++    const uint64_t s_SentAt = s_RestoreSentAtMs.load();
++    if (s_SentAt == 0 || GetTickCount64() - s_SentAt <= k_RestoreAnswerTimeoutMs)
++        return false;
++
++    int s_Sent = k_RestoreSent;
++    if (!s_RestoreState.compare_exchange_strong(s_Sent, k_RestoreFailed))
++        return false;  // the answer arrived meanwhile
++    Logger::Error("[NoMoreAltF4] RESTORE: no answer within {} s. The result is unknown; closing the game anyway.",
++                  k_RestoreAnswerTimeoutMs / 1000);
++    return true;
++}
++
++static void DrawRestoreNotice()
++{
++    const int s_State = s_RestoreState.load();
++    if (s_State != k_RestoreArmed && s_State != k_RestoreSent)
++        return;
++
++    const char* s_Text = (s_State == k_RestoreArmed)
++        ? ICON_MD_RESTORE " NoMoreAltF4: campaign restore armed. In the safehouse, open the gear wall and switch to another page once."
++        : ICON_MD_RESTORE " NoMoreAltF4: saved campaign sent. The game closes in a moment.";
++
++    const uint64_t s_SentAt = s_RestoreSentAtMs.load();
++    const bool s_Slow = (s_State == k_RestoreSent && s_SentAt != 0 && GetTickCount64() - s_SentAt > 3000);
++
++    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, 96.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
++    ImGui::SetNextWindowBgAlpha(0.8f);
++    const ImGuiWindowFlags s_Flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
++        | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav
++        | ImGuiWindowFlags_NoInputs;
++    if (ImGui::Begin("##NoMoreAltF4RestoreNotice", nullptr, s_Flags))
++    {
++        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", s_Text);
++        if (s_Slow)
++            ImGui::TextUnformatted("Waiting for the server. Do not quit through the game's menu: the mod closes the game itself.");
++    }
++    ImGui::End();
+ }
+ 
+ bool NoMoreAltF4::AnySeamlessEnabled() const
+@@ -1117,6 +1501,9 @@
+     lpOptional = SeamlessFilter(hRequest, pwszHeaders, dwHeadersLength,
+                                 lpOptional, dwOptionalLength, dwTotalLength);
+ 
++    // Freelancer campaign restore (one shot, armed from the menu): may replace the
++    // body and its length. Before the logging below, so the log shows what is sent.
++    RestoreFilter(hRequest, lpOptional, dwOptionalLength, dwTotalLength);
+ 
+     // During shutdown, skip all logic and call the original directly.
+     // This prevents accessing freed plugin memory while in-flight calls drain.
+@@ -1632,6 +2019,47 @@
+     void* dwContext, void* hInternet, void* param_3, int dwInternetStatus,
+     void* param_5, int param_6)
+ {
++    // Freelancer campaign restore: the server's answer to the request that
++    // carried the saved campaign. Whatever the outcome, the game is closed: the
++    // body has left, the server may have stored it, and the game's own
++    // (pre-restore) campaign would overwrite it with its next upload. The result
++    // is checked after relaunch, in the safehouse's campaign data.
++    if (hInternet && s_RestoreState.load() == k_RestoreSent && hInternet == s_RestoreRequest.load())
++    {
++        if (dwInternetStatus == WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE)
++        {
++            DWORD s_Status = 0;
++            DWORD s_Size = sizeof(s_Status);
++            const BOOL s_Ok = WinHttpQueryHeaders(static_cast<HINTERNET>(hInternet),
++                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
++                &s_Status, &s_Size, WINHTTP_NO_HEADER_INDEX);
++            s_RestoreHttpStatus = s_Ok ? s_Status : 0;
++
++            if (s_Ok && s_Status == 200)
++            {
++                s_RestoreState.store(k_RestoreAccepted);
++                Logger::Warn("[NoMoreAltF4] RESTORE SENT, server answered HTTP 200. Closing the game now so it cannot "
++                             "overwrite the restored campaign. Launch again and check the safehouse.");
++            }
++            else
++            {
++                s_RestoreState.store(k_RestoreFailed);
++                Logger::Error("[NoMoreAltF4] RESTORE SENT, server answered HTTP {} (0 = unreadable). The result is "
++                              "unknown; closing the game anyway. Check the safehouse after relaunch.",
++                              s_RestoreHttpStatus.load());
++            }
++            KillProcess();
++        }
++        else if (dwInternetStatus == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR
++                 || dwInternetStatus == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING)
++        {
++            s_RestoreState.store(k_RestoreFailed);
++            Logger::Error("[NoMoreAltF4] RESTORE: the request ended without an answer (WinHTTP status 0x{:X}). "
++                          "The result is unknown; closing the game anyway.", static_cast<uint32_t>(dwInternetStatus));
++            KillProcess();
++        }
++    }
++
+     // WINHTTP_CALLBACK_STATUS_SENDING_REQUEST = 0x00000010
+     // At this status the request handle is valid and WinHttpQueryOption(URL) works.
+     // We inspect the URL when either logging is enabled OR network kill is active
+@@ -1898,6 +2326,11 @@
+ 
+         ImGui::Separator();
+ 
++        // --- Freelancer campaign restore ---
++        DrawRestoreMenu();
++
++        ImGui::Separator();
++
+         // --- Abort hotkey ---
+         const char* keyName = "None";
+         switch (m_ManualKillKey)
+diff --git a/src/EventBodyRewriter.h b/src/EventBodyRewriter.h
+--- a/src/EventBodyRewriter.h
++++ b/src/EventBodyRewriter.h
+@@ -87,6 +87,14 @@
+     // ContractSessionId of an event (it could not be neutralized there).
+     Result Neutralize(char* p_Buf, size_t p_Len, Report& p_Report);
+ 
++    // Freelancer campaign restore: finds the first event named CpdSet whose
++    // ContractId equals p_ContractId (given without quotes) and returns the span
++    // of its Value object as [*p_Begin, *p_End) and the body's event count.
++    // p_Matches (optional) receives how many events match (name and ContractId).
++    // False when the body is not a well-formed events body or has no such event.
++    bool FindCpdSetValue(const char* p_Data, size_t p_Len, const char* p_ContractId, size_t p_IdLen,
++                         size_t* p_Begin, size_t* p_End, uint32_t* p_Events, uint32_t* p_Matches = nullptr);
++
+     // ---- server responses ---------------------------------------------------
+ 
+     struct ServerClose
+diff --git a/src/EventBodyRewriter.cpp b/src/EventBodyRewriter.cpp
+--- a/src/EventBodyRewriter.cpp
++++ b/src/EventBodyRewriter.cpp
+@@ -978,6 +978,47 @@
+     return EnterValues(c);
+ }
+ 
++bool FindCpdSetValue(const char* p_Data, size_t p_Len, const char* p_ContractId, size_t p_IdLen,
++                     size_t* p_Begin, size_t* p_End, uint32_t* p_Events, uint32_t* p_Matches)
++{
++    if (p_Matches)
++        *p_Matches = 0;
++    if (!p_Data || !p_ContractId || p_IdLen == 0 || !p_Begin || !p_End)
++        return false;
++
++    Ev s_Events[k_MaxEvents];
++    uint32_t s_Count = 0;
++    if (ScanBody(p_Data, p_Len, s_Events, s_Count) != Result::Clean)
++        return false;
++
++    if (p_Events)
++        *p_Events = s_Count;
++
++    bool s_Found = false;
++    uint32_t s_Matches = 0;
++    for (uint32_t i = 0; i < s_Count; ++i)
++    {
++        const Ev& s_Ev = s_Events[i];
++        if (!TokIs(p_Data, s_Ev.name, "\"CpdSet\""))
++            continue;
++        if (!s_Ev.cid.Has() || !IsStrTok(p_Data, s_Ev.cid) || s_Ev.cid.Len() - 2 != p_IdLen
++            || memcmp(p_Data + s_Ev.cid.b + 1, p_ContractId, p_IdLen) != 0)
++            continue;
++
++        ++s_Matches;
++        if (s_Found || !s_Ev.val.Has() || p_Data[s_Ev.val.b] != '{' || p_Data[s_Ev.val.e - 1] != '}')
++            continue;
++
++        *p_Begin = s_Ev.val.b;
++        *p_End = s_Ev.val.e;
++        s_Found = true;
++    }
++
++    if (p_Matches)
++        *p_Matches = s_Matches;
++    return s_Found;
++}
++
+ Result Neutralize(char* p_Buf, size_t p_Len, Report& p_Report)
+ {
+     p_Report = Report{};
+diff --git a/tests/ebr_replay.cpp b/tests/ebr_replay.cpp
+--- a/tests/ebr_replay.cpp
++++ b/tests/ebr_replay.cpp
+@@ -702,6 +702,47 @@
+         const std::string s_Health = "{\"Timestamp\":1.0,\"Name\":\"Hero_Health\",\"Value\":33.000000,\"UserId\":\"u\"}";
+         CHECK(ebr::ExtractNumberAfter(s_Health.data(), s_Health.size(), "\"Value\":", &s_Tok, &s_TokLen)
+               && std::string(s_Tok, s_TokLen) == "33.000000", "text: health value");
++
++    // ---- Freelancer campaign restore: locating a CpdSet Value ----------------
++    {
++        const std::string s_Cid = "f8ec92c2-4fa2-471e-ae08-545480c746ee";
++        const std::string s_Value = "{\"GearWall_ThematicIndex\":1.000000}";
++        const std::string s_Event = "{\"Name\":\"CpdSet\",\"ContractSessionId\":\"1-a\",\"ContractId\":\"" + s_Cid
++            + "\",\"Value\":" + s_Value + ",\"Timestamp\":442.595337,\"Origin\":\"gameclient\",\"Id\":\"x\"}";
++        const std::string s_Other = "{\"Name\":\"Hero_Health\",\"ContractSessionId\":\"1-a\",\"ContractId\":\"" + s_Cid
++            + "\",\"Value\":33.000000,\"Id\":\"y\"}";
++        const std::string s_Body = "{\"userId\":\"u\",\"values\":[" + s_Other + "," + s_Event + "]}";
++
++        size_t s_B = 0, s_E = 0;
++        uint32_t s_N = 0, s_M = 0;
++        CHECK(ebr::FindCpdSetValue(s_Body.data(), s_Body.size(), s_Cid.data(), s_Cid.size(), &s_B, &s_E, &s_N, &s_M)
++              && s_N == 2 && s_M == 1 && s_Body.substr(s_B, s_E - s_B) == s_Value, "restore: finds the safehouse CpdSet value");
++
++        const std::string s_Two = "{\"userId\":\"u\",\"values\":[" + s_Event + "," + s_Event + "]}";
++        CHECK(ebr::FindCpdSetValue(s_Two.data(), s_Two.size(), s_Cid.data(), s_Cid.size(), &s_B, &s_E, &s_N, &s_M)
++              && s_M == 2, "restore: counts two matching CpdSets");
++
++        const std::string s_Mission = "76fd7c40-83a0-48c9-be49-cef107583eae";
++        CHECK(!ebr::FindCpdSetValue(s_Body.data(), s_Body.size(), s_Mission.data(), s_Mission.size(), &s_B, &s_E, &s_N),
++              "restore: ignores a CpdSet of another contract");
++
++        const std::string s_NoCpd = "{\"userId\":\"u\",\"values\":[" + s_Other + "]}";
++        CHECK(!ebr::FindCpdSetValue(s_NoCpd.data(), s_NoCpd.size(), s_Cid.data(), s_Cid.size(), &s_B, &s_E, &s_N),
++              "restore: no CpdSet, no match");
++
++        // Splice a bigger value in and check that the body still parses.
++        const std::string s_Big = "{\"InventoryItems\":[\"a\",\"b\"],\"MyMoney\":21887.0,\"Hot_MissionFailed\":false,\"S\":\"q\\\"x\"}";
++        ebr::FindCpdSetValue(s_Body.data(), s_Body.size(), s_Cid.data(), s_Cid.size(), &s_B, &s_E, &s_N);
++        const std::string s_New = s_Body.substr(0, s_B) + s_Big + s_Body.substr(s_E);
++        size_t s_B2 = 0, s_E2 = 0;
++        uint32_t s_N2 = 0;
++        CHECK(ebr::FindCpdSetValue(s_New.data(), s_New.size(), s_Cid.data(), s_Cid.size(), &s_B2, &s_E2, &s_N2)
++              && s_N2 == 2 && s_B2 == s_B && s_New.substr(s_B2, s_E2 - s_B2) == s_Big, "restore: spliced body parses");
++
++        const std::string s_Broken = s_Body.substr(0, s_B) + "{\"a\":[1,2}" + s_Body.substr(s_E);
++        CHECK(!ebr::FindCpdSetValue(s_Broken.data(), s_Broken.size(), s_Cid.data(), s_Cid.size(), &s_B2, &s_E2, &s_N2),
++              "restore: a malformed value is refused");
++    }
+     }
+ }
+ 

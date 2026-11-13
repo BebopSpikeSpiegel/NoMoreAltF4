@@ -381,3 +381,7 @@ CMakeUserPresets.json
 # Claude Code
 .claude/
 CLAUDE.md
+
+# Local tools and release material
+tools/crashtrace/
+release/

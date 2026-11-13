@@ -16,6 +16,8 @@ add_library(NoMoreAltF4 SHARED
     src/NoMoreAltF4.h
     src/LogMirror.cpp
     src/LogMirror.h
+    src/EventBodyRewriter.cpp
+    src/EventBodyRewriter.h
 )
 
 # Set UTF-8 flag.
