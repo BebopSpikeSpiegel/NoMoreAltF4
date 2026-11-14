@@ -80,7 +80,7 @@ Built against **ZHMModSDK v4.2.1** and tested on game build **3.290.1.0**. Alway
 
 Disabling the mod at runtime is safe, but its DLL stays loaded until the game exits. After re-enabling it in the same run, restart the game before relying on the saving option.
 
-> **SDK issue: freeze or crash when a mod is disabled at runtime.** ZHMModSDK v4.2.1 can freeze or crash the game when a mod with a menu is switched off while the game is running ([issue #280](https://github.com/OrfeasZ/ZHMModSDK/issues/280)). NoMoreAltF4 works around it for itself, but other mods are still affected. A fix is waiting for review upstream ([PR #326](https://github.com/OrfeasZ/ZHMModSDK/pull/326)). If it bothers you, an unofficial SDK build with the fix is available in the meantime: [v4.2.1-unloadfix](https://github.com/BebopSpikeSpiegel/ZHMModSDK/releases/tag/v4.2.1-unloadfix).
+> **SDK issue: freeze or crash when a mod is disabled at runtime.** ZHMModSDK v4.2.1 can freeze or crash the game when a mod with a menu is switched off while the game is running ([issue #280](https://github.com/OrfeasZ/ZHMModSDK/issues/280)). NoMoreAltF4 works around it for itself, but other mods are still affected. The SDK's maintainer plans to fix it in the SDK himself; there is no date yet (my proposed fix, [PR #326](https://github.com/OrfeasZ/ZHMModSDK/pull/326), was closed in favour of that). If it bothers you, an unofficial SDK build with my fix is available in the meantime: [v4.2.1-unloadfix](https://github.com/BebopSpikeSpiegel/ZHMModSDK/releases/tag/v4.2.1-unloadfix).
 
 ## Why terminating works
 
@@ -146,7 +146,7 @@ NoMoreAltF4 是《杀手：暗杀世界》的 ZHMModSDK 插件，用来防止任
 - 无缝保护会改写发往官方服务器的数据，使用风险自负。
 - 游戏更新后，请先在剧情关卡里试一次。
 - 任务载入过程中不要强行关闭游戏。
-- ZHMModSDK v4.2.1 目前有个问题：游戏运行中关闭带菜单的 Mod 可能卡死或崩溃。本 Mod 自身已规避，其他 Mod 仍受影响。修复已提交给官方（[PR #326](https://github.com/OrfeasZ/ZHMModSDK/pull/326)），还在等待审核。介意的话可以先用我的非官方修复版 SDK：[v4.2.1-unloadfix](https://github.com/BebopSpikeSpiegel/ZHMModSDK/releases/tag/v4.2.1-unloadfix)。
+- ZHMModSDK v4.2.1 目前有个问题：游戏运行中关闭带菜单的 Mod 可能卡死或崩溃。本 Mod 自身已规避，其他 Mod 仍受影响。SDK 作者表示会自己在 SDK 里修复，时间未定（我提交的 [PR #326](https://github.com/OrfeasZ/ZHMModSDK/pull/326) 因此被关闭）。介意的话可以先用我的非官方修复版 SDK：[v4.2.1-unloadfix](https://github.com/BebopSpikeSpiegel/ZHMModSDK/releases/tag/v4.2.1-unloadfix)。
 
 ## License
 
